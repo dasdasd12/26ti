@@ -1,0 +1,13 @@
+# Generated simulation artifacts
+/icarus/
+/sim/*.vcd
+/sim/*.fst
+/build/
+/.Xil/
+/hs_err_pid*.dmp
+/hs_err_pid*.log
+/phase sim/output/
+/phase sim/direct_output/
+
+# PDF inspection intermediates
+/tmp/
