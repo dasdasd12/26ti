@@ -1,7 +1,9 @@
 `timescale 1ns/1ps
 
 module manual_control #(
-    parameter integer DEBOUNCE_CYCLES = 1_000_000
+    parameter integer DEBOUNCE_CYCLES = 1_000_000,
+    parameter integer PHASE_HOLD_DELAY_CYCLES = 50_000_000,
+    parameter integer PHASE_REPEAT_CYCLES = 500_000
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -21,12 +23,26 @@ module manual_control #(
     localparam logic [1:0] MODE_QUADRATURE = 2'd1;
     localparam logic [1:0] MODE_DOUBLE = 2'd2;
     localparam logic [1:0] AMP_8DIV = 2'd3;
+    localparam integer HOLD_COUNTER_WIDTH =
+        (PHASE_HOLD_DELAY_CYCLES <= 1) ? 1 :
+        $clog2(PHASE_HOLD_DELAY_CYCLES);
+    localparam integer REPEAT_COUNTER_WIDTH =
+        (PHASE_REPEAT_CYCLES <= 1) ? 1 :
+        $clog2(PHASE_REPEAT_CYCLES);
 
     logic key1_press;
     logic key2_press;
     logic key3_press;
     logic key5_press;
     logic key6_press;
+    logic key5_pressed;
+    logic key6_pressed;
+    logic key5_repeat_pulse;
+    logic key6_repeat_pulse;
+    logic [HOLD_COUNTER_WIDTH-1:0] key5_hold_count;
+    logic [HOLD_COUNTER_WIDTH-1:0] key6_hold_count;
+    logic [REPEAT_COUNTER_WIDTH-1:0] key5_repeat_count;
+    logic [REPEAT_COUNTER_WIDTH-1:0] key6_repeat_count;
 
     button_debounce #(
         .DEBOUNCE_CYCLES(DEBOUNCE_CYCLES)
@@ -61,7 +77,8 @@ module manual_control #(
         .clk(clk),
         .rst_n(rst_n),
         .button_n(key5_n),
-        .press_pulse(key5_press)
+        .press_pulse(key5_press),
+        .pressed(key5_pressed)
     );
 
     button_debounce #(
@@ -70,12 +87,67 @@ module manual_control #(
         .clk(clk),
         .rst_n(rst_n),
         .button_n(key6_n),
-        .press_pulse(key6_press)
+        .press_pulse(key6_press),
+        .pressed(key6_pressed)
     );
 
     always @* begin
-        fine_phase_inc_pulse = !wireless_mode && key5_press;
-        fine_phase_dec_pulse = !wireless_mode && key6_press;
+        fine_phase_inc_pulse =
+            !wireless_mode && (key5_press || key5_repeat_pulse);
+        fine_phase_dec_pulse =
+            !wireless_mode && (key6_press || key6_repeat_pulse);
+    end
+
+    // A short press remains one high-resolution step. Holding a phase key
+    // starts auto-repeat after 0.5 s and repeats at 200 steps/s by default.
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            key5_hold_count <= '0;
+            key6_hold_count <= '0;
+            key5_repeat_count <= '0;
+            key6_repeat_count <= '0;
+            key5_repeat_pulse <= 1'b0;
+            key6_repeat_pulse <= 1'b0;
+        end else begin
+            key5_repeat_pulse <= 1'b0;
+            key6_repeat_pulse <= 1'b0;
+
+            if (wireless_mode || !key5_pressed) begin
+                key5_hold_count <= '0;
+                key5_repeat_count <= '0;
+            end else if ((PHASE_HOLD_DELAY_CYCLES <= 1) ||
+                         (key5_hold_count ==
+                          PHASE_HOLD_DELAY_CYCLES - 1)) begin
+                if ((PHASE_REPEAT_CYCLES <= 1) ||
+                    (key5_repeat_count ==
+                     PHASE_REPEAT_CYCLES - 1)) begin
+                    key5_repeat_count <= '0;
+                    key5_repeat_pulse <= 1'b1;
+                end else begin
+                    key5_repeat_count <= key5_repeat_count + 1'b1;
+                end
+            end else begin
+                key5_hold_count <= key5_hold_count + 1'b1;
+            end
+
+            if (wireless_mode || !key6_pressed) begin
+                key6_hold_count <= '0;
+                key6_repeat_count <= '0;
+            end else if ((PHASE_HOLD_DELAY_CYCLES <= 1) ||
+                         (key6_hold_count ==
+                          PHASE_HOLD_DELAY_CYCLES - 1)) begin
+                if ((PHASE_REPEAT_CYCLES <= 1) ||
+                    (key6_repeat_count ==
+                     PHASE_REPEAT_CYCLES - 1)) begin
+                    key6_repeat_count <= '0;
+                    key6_repeat_pulse <= 1'b1;
+                end else begin
+                    key6_repeat_count <= key6_repeat_count + 1'b1;
+                end
+            end else begin
+                key6_hold_count <= key6_hold_count + 1'b1;
+            end
+        end
     end
 
     always_ff @(posedge clk or negedge rst_n) begin

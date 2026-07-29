@@ -8,7 +8,9 @@ module lissajous_core #(
     parameter integer ZERO_HYST_CODE = 4,
     parameter integer PHASE_PIPELINE_COMP_SAMPLES = 2,
     parameter integer PHASE_LOCK_CONFIRM_CYCLES = 3,
-    parameter integer MAX_PHASE_CAL_SAMPLES = 32
+    parameter integer MAX_PHASE_CAL_SAMPLES = 96,
+    // 2^32 / 3600: one manual key step is approximately 0.1 degree.
+    parameter [31:0] MANUAL_PHASE_STEP_WORD = 32'd1_193_046
 ) (
     input  logic clk,
     input  logic rst_n,
@@ -33,8 +35,12 @@ module lissajous_core #(
     localparam integer MIN_VALID_PERIOD = SAMPLE_RATE_HZ / 125_000;
     localparam integer MAX_VALID_PERIOD = SAMPLE_RATE_HZ / 500;
     localparam logic [31:0] PHASE_QUARTER = 32'h4000_0000;
-    localparam integer FINE_PHASE_FRACTION_BITS = 4;
-    localparam logic signed [11:0] MAX_FINE_PHASE_Q4 = 12'sd512;
+    localparam logic signed [32:0] MANUAL_PHASE_STEP =
+        $signed({1'b0, MANUAL_PHASE_STEP_WORD});
+    localparam logic signed [32:0] MAX_MANUAL_PHASE =
+        33'sd2_147_483_647;
+    localparam logic signed [32:0] MIN_MANUAL_PHASE =
+        -33'sd2_147_483_648;
 
     logic signed [10:0] current_sample;
     logic signed [10:0] dds_sample;
@@ -56,13 +62,16 @@ module lissajous_core #(
     logic signed [16:0] feedback_error_candidate;
     logic [2:0] phase_stable_count;
     logic signed [7:0] phase_calibration_samples;
+    logic signed [16:0] phase_calibration_sum;
     logic [7:0] phase_calibration_magnitude;
     logic [31:0] phase_calibration_adjust;
     (* mark_debug = "true", keep = "true" *)
-    logic signed [11:0] manual_phase_trim_q4;
-    logic [11:0] manual_phase_trim_magnitude;
-    logic [43:0] manual_phase_product;
+    logic signed [32:0] manual_phase_trim_word;
     logic [31:0] manual_phase_adjust;
+    logic [15:0] phase_calibration_period;
+    logic [16:0] calibration_period_difference;
+    logic [15:0] frequency_change_threshold;
+    logic frequency_change_detected;
 
     logic phase_step_start;
     logic [15:0] phase_divisor;
@@ -182,21 +191,36 @@ module lissajous_core #(
                 active_phase_step * phase_calibration_magnitude;
         end
 
-        if (manual_phase_trim_q4[11]) begin
-            manual_phase_trim_magnitude =
-                (~manual_phase_trim_q4) + 1'b1;
-            manual_phase_product =
-                active_phase_step * manual_phase_trim_magnitude;
-            manual_phase_adjust =
-                32'd0 -
-                (manual_phase_product >> FINE_PHASE_FRACTION_BITS);
+        phase_calibration_sum =
+            {{9{phase_calibration_samples[7]}},
+             phase_calibration_samples} +
+            feedback_error_candidate;
+
+        if (period_candidate >= {1'b0, phase_calibration_period}) begin
+            calibration_period_difference =
+                period_candidate - {1'b0, phase_calibration_period};
         end else begin
-            manual_phase_trim_magnitude =
-                manual_phase_trim_q4[11:0];
-            manual_phase_product =
-                active_phase_step * manual_phase_trim_magnitude;
-            manual_phase_adjust =
-                manual_phase_product >> FINE_PHASE_FRACTION_BITS;
+            calibration_period_difference =
+                {1'b0, phase_calibration_period} - period_candidate;
+        end
+
+        frequency_change_threshold = phase_calibration_period >> 8;
+        if (frequency_change_threshold < 16'd2) begin
+            frequency_change_threshold = 16'd2;
+        end
+        frequency_change_detected =
+            phase_cal_locked &&
+            (phase_calibration_period != 16'd0) &&
+            (calibration_period_difference >
+             {1'b0, frequency_change_threshold});
+
+        // Manual trim represents an angle, not a time delay. It is therefore
+        // independent of input frequency. Hide it while automatic delay
+        // calibration is unlocked so the two corrections cannot cancel.
+        if (phase_cal_locked) begin
+            manual_phase_adjust = manual_phase_trim_word[31:0];
+        end else begin
+            manual_phase_adjust = 32'd0;
         end
 
         if (rising_crossing && phase_step_ready) begin
@@ -207,14 +231,17 @@ module lissajous_core #(
 
         compensated_phase = base_phase +
             (active_phase_step * PHASE_PIPELINE_COMP_SAMPLES) +
-            phase_calibration_adjust +
-            manual_phase_adjust;
+            phase_calibration_adjust;
 
         case (mode_sel)
-            MODE_DIRECT: dds_phase = compensated_phase;
+            MODE_DIRECT:
+                dds_phase = compensated_phase + manual_phase_adjust;
             MODE_QUADRATURE:
-                dds_phase = compensated_phase + PHASE_QUARTER;
-            MODE_DOUBLE: dds_phase = compensated_phase << 1;
+                dds_phase = compensated_phase + PHASE_QUARTER +
+                            manual_phase_adjust;
+            MODE_DOUBLE:
+                dds_phase = (compensated_phase << 1) +
+                            manual_phase_adjust;
             default: dds_phase = 32'd0;
         endcase
 
@@ -245,7 +272,8 @@ module lissajous_core #(
             feedback_crossing_armed <= 1'b0;
             feedback_age_counter <= 16'd0;
             phase_calibration_samples <= 8'sd0;
-            manual_phase_trim_q4 <= 12'sd0;
+            manual_phase_trim_word <= 33'sd0;
+            phase_calibration_period <= 16'd0;
             phase_stable_count <= 3'd0;
             phase_cal_locked <= 1'b0;
             phase_error_samples <= 17'sd0;
@@ -257,18 +285,21 @@ module lissajous_core #(
                 phase_cal_locked <= 1'b0;
             end
 
-            // KEY5/KEY6 are a post-lock fine trim. One count is 1/16 of
-            // the measured AD sample interval and the value is retained
-            // across mode changes. Simultaneous presses intentionally cancel.
+            // KEY5/KEY6 are a post-lock fixed-angle trim. One count is about
+            // 0.1 degree and is retained across frequency/mode changes.
+            // Simultaneous presses intentionally cancel.
             if (phase_cal_enable && phase_cal_locked) begin
                 if (fine_phase_inc_pulse && !fine_phase_dec_pulse &&
-                    (manual_phase_trim_q4 < MAX_FINE_PHASE_Q4)) begin
-                    manual_phase_trim_q4 <= manual_phase_trim_q4 + 1'b1;
+                    (manual_phase_trim_word <=
+                     MAX_MANUAL_PHASE - MANUAL_PHASE_STEP)) begin
+                    manual_phase_trim_word <=
+                        manual_phase_trim_word + MANUAL_PHASE_STEP;
                 end else if (fine_phase_dec_pulse &&
                              !fine_phase_inc_pulse &&
-                             (manual_phase_trim_q4 >
-                              -MAX_FINE_PHASE_Q4)) begin
-                    manual_phase_trim_q4 <= manual_phase_trim_q4 - 1'b1;
+                             (manual_phase_trim_word >=
+                              MIN_MANUAL_PHASE + MANUAL_PHASE_STEP)) begin
+                    manual_phase_trim_word <=
+                        manual_phase_trim_word - MANUAL_PHASE_STEP;
                 end
             end
 
@@ -312,6 +343,7 @@ module lissajous_core #(
                             if (phase_stable_count >=
                                 PHASE_LOCK_CONFIRM_CYCLES - 1) begin
                                 phase_cal_locked <= 1'b1;
+                                phase_calibration_period <= measured_period;
                             end else begin
                                 phase_stable_count <=
                                     phase_stable_count + 1'b1;
@@ -319,15 +351,27 @@ module lissajous_core #(
                         end else if ((feedback_error_candidate > 17'sd1) &&
                                      (phase_calibration_samples <
                                       MAX_PHASE_CAL_SAMPLES)) begin
-                            phase_calibration_samples <=
-                                phase_calibration_samples + 1'b1;
+                            if (phase_calibration_sum >
+                                MAX_PHASE_CAL_SAMPLES) begin
+                                phase_calibration_samples <=
+                                    MAX_PHASE_CAL_SAMPLES;
+                            end else begin
+                                phase_calibration_samples <=
+                                    phase_calibration_sum[7:0];
+                            end
                             phase_stable_count <= 3'd0;
                             phase_cal_locked <= 1'b0;
                         end else if ((feedback_error_candidate < -17'sd1) &&
                                      (phase_calibration_samples >
                                       -MAX_PHASE_CAL_SAMPLES)) begin
-                            phase_calibration_samples <=
-                                phase_calibration_samples - 1'b1;
+                            if (phase_calibration_sum <
+                                -MAX_PHASE_CAL_SAMPLES) begin
+                                phase_calibration_samples <=
+                                    -MAX_PHASE_CAL_SAMPLES;
+                            end else begin
+                                phase_calibration_samples <=
+                                    phase_calibration_sum[7:0];
+                            end
                             phase_stable_count <= 3'd0;
                             phase_cal_locked <= 1'b0;
                         end
@@ -345,6 +389,17 @@ module lissajous_core #(
                         measured_period <= period_candidate[15:0];
                         phase_divisor <= period_candidate[15:0];
                         phase_step_start <= 1'b1;
+
+                        // A lock is valid only for the frequency at which its
+                        // analog-loop delay was measured. Reacquire after a
+                        // significant period change; normal +/-1 sample
+                        // crossing jitter is ignored.
+                        if (frequency_change_detected) begin
+                            phase_cal_locked <= 1'b0;
+                            phase_stable_count <= 3'd0;
+                            phase_calibration_period <=
+                                period_candidate[15:0];
+                        end
                     end
                     crossing_seen <= 1'b1;
 

@@ -32,6 +32,7 @@ module tb_lissajous_top;
     logic [9:0] feedback_delay_0;
     logic [9:0] feedback_delay_1;
     logic [9:0] feedback_delay_2;
+    logic signed [32:0] fine_trim_before;
 
     real phase_rad;
     real phase_step;
@@ -49,7 +50,6 @@ module tb_lissajous_top;
     integer sample_index;
     integer lock_wait_count;
     integer phase_cal_wait_count;
-    integer fine_trim_before;
     longint signed correlation;
     longint signed x_energy;
     real correlation_ratio;
@@ -59,6 +59,8 @@ module tb_lissajous_top;
         .CONVERTER_CLK_HZ(CONVERTER_CLK_HZ),
         .SOFT_RESET_CYCLES(8),
         .DEBOUNCE_CYCLES(4),
+        .PHASE_HOLD_DELAY_CYCLES(100),
+        .PHASE_REPEAT_CYCLES(20),
         .ADC_MID_CODE(512),
         .DAC_MID_CODE(512),
         .CAL_PEAK_CODE(256)
@@ -324,7 +326,7 @@ module tb_lissajous_top;
 
         // Fine trim must remain disabled until the feedback calibration locks.
         press_key5();
-        if (dut.u_lissajous_core.manual_phase_trim_q4 !== 12'sd0) begin
+        if (dut.u_lissajous_core.manual_phase_trim_word !== 33'sd0) begin
             $display("[CHECK FAIL] KEY5 changed phase before calibration lock");
             error_count = error_count + 1;
         end else begin
@@ -347,21 +349,23 @@ module tb_lissajous_top;
                      dut.phase_error_samples);
         end
 
-        // One press is 1/16 sample. KEY5 advances phase, KEY6 retards it.
+        // One short press is a frequency-independent 0.1 degree step.
         fine_trim_before =
-            $signed(dut.u_lissajous_core.manual_phase_trim_q4);
+            $signed(dut.u_lissajous_core.manual_phase_trim_word);
         press_key5();
-        if ($signed(dut.u_lissajous_core.manual_phase_trim_q4) !==
-            fine_trim_before + 1) begin
-            $display("[CHECK FAIL] KEY5 fine phase increment is not +1 Q4");
+        if ($signed(dut.u_lissajous_core.manual_phase_trim_word) !==
+            fine_trim_before +
+            $signed({1'b0,
+                     dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD})) begin
+            $display("[CHECK FAIL] KEY5 fixed-angle increment is incorrect");
             error_count = error_count + 1;
         end else begin
-            $display("[CHECK PASS] KEY5 advances phase by 1/16 sample");
+            $display("[CHECK PASS] KEY5 advances phase by 0.1 degree");
         end
         #1;
         if (dut.u_lissajous_core.manual_phase_adjust !==
-            (dut.u_lissajous_core.active_phase_step >> 4)) begin
-            $display("[CHECK FAIL] positive Q4 trim was not converted to DDS phase");
+            dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD) begin
+            $display("[CHECK FAIL] positive fixed-angle DDS word is incorrect");
             error_count = error_count + 1;
         end
         if (!dut.phase_cal_locked) begin
@@ -370,25 +374,27 @@ module tb_lissajous_top;
         end
 
         press_key6();
-        if ($signed(dut.u_lissajous_core.manual_phase_trim_q4) !==
+        if ($signed(dut.u_lissajous_core.manual_phase_trim_word) !==
             fine_trim_before) begin
-            $display("[CHECK FAIL] KEY6 fine phase decrement is not -1 Q4");
+            $display("[CHECK FAIL] KEY6 fixed-angle decrement is incorrect");
             error_count = error_count + 1;
         end else begin
-            $display("[CHECK PASS] KEY6 retards phase by 1/16 sample");
+            $display("[CHECK PASS] KEY6 retards phase by 0.1 degree");
         end
 
         press_key6();
         #1;
-        if (($signed(dut.u_lissajous_core.manual_phase_trim_q4) !==
-             fine_trim_before - 1) ||
+        if (($signed(dut.u_lissajous_core.manual_phase_trim_word) !==
+             fine_trim_before -
+             $signed({1'b0,
+                      dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD})) ||
             (dut.u_lissajous_core.manual_phase_adjust !==
              (32'd0 -
-              (dut.u_lissajous_core.active_phase_step >> 4)))) begin
-            $display("[CHECK FAIL] negative Q4 trim conversion is incorrect");
+              dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD))) begin
+            $display("[CHECK FAIL] negative fixed-angle DDS word is incorrect");
             error_count = error_count + 1;
         end else begin
-            $display("[CHECK PASS] negative Q4 trim converts to DDS phase");
+            $display("[CHECK PASS] negative fixed-angle trim is correct");
         end
         press_key5();
 
@@ -542,11 +548,27 @@ module tb_lissajous_top;
         // largest supported delay at 1kHz.
         press_key2();
         press_key2();
+        press_key5();
+        fine_trim_before =
+            $signed(dut.u_lissajous_core.manual_phase_trim_word);
         @(negedge ad_clk);
         phase_rad = 0.0;
         phase_step = 6.283185307179586 *
                      LOW_FREQ_HZ / CONVERTER_CLK_HZ;
         wait_dac_samples(LOW_FREQ_PERIOD_SAMPLES * 3);
+
+        if (dut.phase_cal_locked) begin
+            $display("[CHECK FAIL] frequency change did not invalidate phase lock");
+            error_count = error_count + 1;
+        end else if (($signed(
+                     dut.u_lissajous_core.manual_phase_trim_word) !==
+                     fine_trim_before) ||
+                     (dut.u_lissajous_core.manual_phase_adjust !== 32'd0)) begin
+            $display("[CHECK FAIL] fixed-angle trim was lost or active during relock");
+            error_count = error_count + 1;
+        end else begin
+            $display("[CHECK PASS] frequency change requests clean phase relock");
+        end
 
         if ((dut.measured_period < LOW_FREQ_PERIOD_SAMPLES - 2) ||
             (dut.measured_period > LOW_FREQ_PERIOD_SAMPLES + 2)) begin
@@ -602,6 +624,49 @@ module tb_lissajous_top;
         end
         check_led_state(4'b1111, "direct/8div restored");
 
+        phase_cal_wait_count = 0;
+        while (!dut.phase_cal_locked &&
+               (phase_cal_wait_count < LOW_FREQ_PERIOD_SAMPLES * 10)) begin
+            @(posedge da_clk);
+            phase_cal_wait_count = phase_cal_wait_count + 1;
+        end
+        if (!dut.phase_cal_locked ||
+            ($signed(dut.u_lissajous_core.manual_phase_trim_word) !==
+             fine_trim_before) ||
+            (dut.u_lissajous_core.manual_phase_adjust !==
+             fine_trim_before[31:0])) begin
+            $display("[CHECK FAIL] 1kHz relock: locked=%0b wait=%0d trim=%0d expected=%0d adjust=%h coarse=%0d error=%0d cal_period=%0d",
+                     dut.phase_cal_locked,
+                     phase_cal_wait_count,
+                     $signed(dut.u_lissajous_core.manual_phase_trim_word),
+                     fine_trim_before,
+                     dut.u_lissajous_core.manual_phase_adjust,
+                     dut.u_lissajous_core.phase_calibration_samples,
+                     dut.phase_error_samples,
+                     dut.u_lissajous_core.phase_calibration_period);
+            error_count = error_count + 1;
+        end else begin
+            $display("[CHECK PASS] 1kHz relock restores the same phase angle");
+        end
+
+        // Holding a phase key must auto-repeat while preserving short-press
+        // resolution. Small parameter overrides keep this test short.
+        fine_trim_before =
+            $signed(dut.u_lissajous_core.manual_phase_trim_word);
+        key5_n = 1'b0;
+        repeat (260) @(posedge dut.sys_clk_100m);
+        key5_n = 1'b1;
+        repeat (10) @(posedge dut.sys_clk_100m);
+        if ($signed(dut.u_lissajous_core.manual_phase_trim_word) <=
+            fine_trim_before +
+            $signed({1'b0,
+                     dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD})) begin
+            $display("[CHECK FAIL] held KEY5 did not auto-repeat");
+            error_count = error_count + 1;
+        end else begin
+            $display("[CHECK PASS] held KEY5 auto-repeats phase adjustment");
+        end
+
         press_key1();
         wait_dac_samples(2);
         if (dut.wireless_mode !== 1'b1 ||
@@ -618,13 +683,13 @@ module tb_lissajous_top;
         press_key2();
         press_key3();
         fine_trim_before =
-            $signed(dut.u_lissajous_core.manual_phase_trim_q4);
+            $signed(dut.u_lissajous_core.manual_phase_trim_word);
         press_key5();
         press_key6();
         wait_dac_samples(2);
         if (dut.mode_sel !== 2'd0 ||
             dut.amplitude_sel !== 2'd3 ||
-            $signed(dut.u_lissajous_core.manual_phase_trim_q4) !==
+            $signed(dut.u_lissajous_core.manual_phase_trim_word) !==
                 fine_trim_before ||
             da_data !== 10'd512) begin
             $display("[CHECK FAIL] a wired-only key changed wireless state");

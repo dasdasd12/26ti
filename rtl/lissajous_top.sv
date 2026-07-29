@@ -5,6 +5,8 @@ module lissajous_top #(
     parameter integer CONVERTER_CLK_HZ = 12_500_000,
     parameter integer SOFT_RESET_CYCLES = 32,
     parameter integer DEBOUNCE_CYCLES = 1_000_000,
+    parameter integer PHASE_HOLD_DELAY_CYCLES = SYS_CLK_HZ / 2,
+    parameter integer PHASE_REPEAT_CYCLES = SYS_CLK_HZ / 200,
     parameter integer ADC_MID_CODE = 512,
     parameter integer DAC_MID_CODE = 512,
     parameter integer CAL_PEAK_CODE = 256
@@ -73,7 +75,9 @@ module lissajous_top #(
     );
 
     manual_control #(
-        .DEBOUNCE_CYCLES(DEBOUNCE_CYCLES)
+        .DEBOUNCE_CYCLES(DEBOUNCE_CYCLES),
+        .PHASE_HOLD_DELAY_CYCLES(PHASE_HOLD_DELAY_CYCLES),
+        .PHASE_REPEAT_CYCLES(PHASE_REPEAT_CYCLES)
     ) u_manual_control (
         .clk(sys_clk_100m),
         .rst_n(rst_n),
