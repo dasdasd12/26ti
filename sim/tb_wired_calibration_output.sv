@@ -7,8 +7,8 @@ module tb_wired_calibration_output;
     localparam integer ADC_PEAK_CODE = 205;
     localparam integer TEST_CAL_BLOCK_SAMPLES = 3_000;
     localparam integer TEST_CAL_AVERAGING_BLOCKS = 32;
-    localparam logic [47:0] EXPECTED_10K_STEP =
-        (((64'd1 << 48) * 10_000) +
+    localparam logic [47:0] EXPECTED_100K_STEP =
+        (((80'd1 << 48) * 100_000) +
          (CONVERTER_CLK_HZ / 2)) /
         CONVERTER_CLK_HZ;
 
@@ -19,6 +19,8 @@ module tb_wired_calibration_output;
     logic key4_n;
     logic key5_n;
     logic key6_n;
+    logic uart_rx;
+    logic uart_tx;
     logic [9:0] ad_data;
     logic [9:0] ad2_data;
     logic ad_clk;
@@ -33,7 +35,7 @@ module tb_wired_calibration_output;
     logic source_enable;
     logic [15:0] noise_lfsr;
     logic [47:0] saved_dac2_step;
-    logic [47:0] expected_dac2_97k8_step;
+    logic [47:0] expected_wireless_step;
 
     real source_phase;
     real source_frequency_hz;
@@ -53,6 +55,7 @@ module tb_wired_calibration_output;
     integer dac2_toggle_count;
     integer previous_dac1;
     integer previous_dac2;
+    integer wireless_dac2_mismatch_count;
     longint signed correlation;
     longint signed input_energy;
     lissajous_top #(
@@ -62,8 +65,8 @@ module tb_wired_calibration_output;
             TEST_CAL_BLOCK_SAMPLES),
         .FREQUENCY_CAL_AVERAGING_BLOCKS(
             TEST_CAL_AVERAGING_BLOCKS),
-        .DPLL_MIN_FREQUENCY_HZ(10_000),
-        .DPLL_MAX_FREQUENCY_HZ(12_000),
+        .DPLL_MIN_FREQUENCY_HZ(98_000),
+        .DPLL_MAX_FREQUENCY_HZ(102_000),
         .DPLL_COARSE_STEP_HZ(2_000),
         .DPLL_COARSE_WINDOW_SAMPLES(30_000),
         .DPLL_FINE_RADIUS_STEPS(0),
@@ -79,6 +82,8 @@ module tb_wired_calibration_output;
         .key4_n(key4_n),
         .key5_n(key5_n),
         .key6_n(key6_n),
+        .uart_rx(uart_rx),
+        .uart_tx(uart_tx),
         .ad_data(ad_data),
         .ad2_data(ad2_data),
         .ad_clk(ad_clk),
@@ -159,12 +164,61 @@ module tb_wired_calibration_output;
         end
     endtask
 
+    task automatic press_key2;
+        begin
+            key2_n = 1'b0;
+            repeat (10) @(posedge pl_clk_50m);
+            key2_n = 1'b1;
+            repeat (10) @(posedge pl_clk_50m);
+        end
+    endtask
+
     task automatic press_key5;
         begin
             key5_n = 1'b0;
             repeat (10) @(posedge pl_clk_50m);
             key5_n = 1'b1;
             repeat (10) @(posedge pl_clk_50m);
+        end
+    endtask
+
+    task automatic press_key6;
+        begin
+            key6_n = 1'b0;
+            repeat (10) @(posedge pl_clk_50m);
+            key6_n = 1'b1;
+            repeat (10) @(posedge pl_clk_50m);
+        end
+    endtask
+
+    task automatic check_dac2_frequency_selection(
+        input logic [2:0] expected_selection,
+        input integer expected_index_100hz
+    );
+        logic [63:0] expected_numerator;
+        logic [47:0] expected_step;
+        begin
+            wait (dut.core_dac2_frequency_sel ===
+                  expected_selection);
+            // The scale divider runs only when the selection changes.
+            repeat (100) @(posedge da_clk);
+            expected_numerator =
+                (dut.frequency_cal_phase_step *
+                 expected_index_100hz) + 500;
+            expected_step = expected_numerator / 1000;
+            if (dut.dac2_test_phase_step !== expected_step) begin
+                $display("[CHECK FAIL] DAC2 selection=%0d index=%0d step=%0d expected=%0d",
+                         expected_selection,
+                         expected_index_100hz,
+                         dut.dac2_test_phase_step,
+                         expected_step);
+                error_count = error_count + 1;
+            end else begin
+                $display("[CHECK PASS] DAC2 selection=%0d outputs %0d00 Hz step=%0d",
+                         expected_selection,
+                         expected_index_100hz,
+                         dut.dac2_test_phase_step);
+            end
         end
     endtask
 
@@ -212,7 +266,7 @@ module tb_wired_calibration_output;
         $dumpvars(0, dut.frequency_cal_locked);
         $dumpvars(0, dut.frequency_cal_phase_step);
         $dumpvars(0, dut.dac2_test_phase_step);
-        $dumpvars(0, dut.core_dac2_reference_frequency_sel);
+        $dumpvars(0, dut.core_dac2_frequency_sel);
 
         pl_clk_50m = 1'b0;
         key1_n = 1'b1;
@@ -221,16 +275,45 @@ module tb_wired_calibration_output;
         key4_n = 1'b1;
         key5_n = 1'b1;
         key6_n = 1'b1;
+        uart_rx = 1'b1;
         ad_data = ADC_MID_CODE;
         ad2_data = ADC_MID_CODE;
         source_enable = 1'b1;
         noise_lfsr = 16'h1ace;
         source_phase = 0.731;
-        source_frequency_hz = 10_000.0;
+        source_frequency_hz = 100_000.0;
         error_count = 0;
 
         wait (dut.converter_rst_n === 1'b1);
-        wait_for_dpll_lock(10_000.0, 500_000);
+        wait_for_dpll_lock(100_000.0, 500_000);
+
+        // Wireless mode must never fall back to the nominal 30 MHz clock.
+        // Before KEY4 calibration, even a valid physical START request keeps
+        // both DAC channels at midpoint.
+        press_key1();
+        wait (dut.core_wireless_mode === 1'b1);
+        press_key2();
+        repeat (20) @(posedge da_clk);
+        if (dut.core_wireless_pulse_active !== 1'b0) begin
+            $display("[CHECK FAIL] uncalibrated physical START was accepted");
+            error_count = error_count + 1;
+        end
+        repeat (6_000) begin
+            @(posedge da_clk);
+            #1;
+            if ((da_data !== 10'd512) ||
+                (da2_data !== 10'd512)) begin
+                $display("[CHECK FAIL] uncalibrated wireless output was not midpoint");
+                error_count = error_count + 1;
+            end
+        end
+        if (error_count == 0) begin
+            $display("[CHECK PASS] uncalibrated wireless DAC1/DAC2 stay at midpoint");
+        end
+        press_key1();
+        wait (dut.core_wireless_mode === 1'b0);
+        wait (dut.period_locked === 1'b0);
+        wait_for_dpll_lock(100_000.0, 500_000);
 
         // DAC1 is restored to the normal continuously locked wired output.
         // DAC2 remains quiet until KEY4 frequency calibration completes.
@@ -293,15 +376,15 @@ module tb_wired_calibration_output;
             previous_dac1 = da_data;
             wait_count = wait_count + 1;
         end
-        // DAC2 computes 489/50 once with an iterative divider after the
-        // calibration word is frozen.
+        // DAC2 computes the selected ratio once with an iterative divider
+        // after the 100 kHz calibration word is frozen.
         repeat (100) @(posedge da_clk);
 
         if (!dut.frequency_cal_locked ||
             (dut.frequency_cal_phase_step <
-             EXPECTED_10K_STEP - 48'd500_000) ||
+             EXPECTED_100K_STEP - 48'd500_000) ||
             (dut.frequency_cal_phase_step >
-             EXPECTED_10K_STEP + 48'd500_000) ||
+             EXPECTED_100K_STEP + 48'd500_000) ||
             (dac1_toggle_count < 20_000) ||
             (led_n !== 4'b0111)) begin
             $display("[CHECK FAIL] independent KEY4 calibration: locked=%0b step=%0d DAC1_toggles=%0d led=%b",
@@ -314,23 +397,13 @@ module tb_wired_calibration_output;
             $display("[CHECK PASS] KEY4 calibrates DAC2/wireless while DAC1 DPLL continues");
         end
 
-        expected_dac2_97k8_step =
-            ((dut.frequency_cal_phase_step * 64'd489) + 25) / 50;
-        if (dut.dac2_test_phase_step !==
-            expected_dac2_97k8_step) begin
-            $display("[CHECK FAIL] DAC2 default is not calibrated 97.8kHz: step=%0d expected=%0d",
-                     dut.dac2_test_phase_step,
-                     expected_dac2_97k8_step);
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] DAC2 defaults to calibrated 97.8kHz");
-        end
+        check_dac2_frequency_selection(3'd0, 10);
 
         min_dac2 = 1023;
         max_dac2 = 0;
         dac2_toggle_count = 0;
         previous_dac2 = da2_data;
-        repeat (6_000) begin
+        repeat (30_000) begin
             @(posedge da_clk);
             #1;
             if (da2_data < min_dac2) min_dac2 = da2_data;
@@ -340,59 +413,100 @@ module tb_wired_calibration_output;
             previous_dac2 = da2_data;
         end
         if ((min_dac2 != 307) || (max_dac2 != 717) ||
-            (dac2_toggle_count < 3_000)) begin
-            $display("[CHECK FAIL] DAC2 97.8kHz output range=%0d..%0d toggles=%0d",
+            (dac2_toggle_count < 100)) begin
+            $display("[CHECK FAIL] DAC2 1kHz output range=%0d..%0d toggles=%0d",
                      min_dac2, max_dac2,
                      dac2_toggle_count);
             error_count = error_count + 1;
         end
 
         press_key5();
-        wait (dut.core_dac2_reference_frequency_sel === 1'b1);
-        repeat (4) @(posedge da_clk);
-        if (dut.dac2_test_phase_step !==
-            dut.frequency_cal_phase_step) begin
-            $display("[CHECK FAIL] KEY5 did not select calibrated 10kHz");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY5 selects calibrated 10kHz on DAC2");
-        end
+        check_dac2_frequency_selection(3'd1, 204);
 
         press_key5();
-        wait (dut.core_dac2_reference_frequency_sel === 1'b0);
-        repeat (4) @(posedge da_clk);
-        if (dut.dac2_test_phase_step !==
-            expected_dac2_97k8_step) begin
-            $display("[CHECK FAIL] KEY5 did not return DAC2 to 97.8kHz");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY5 returns DAC2 to calibrated 97.8kHz");
-        end
+        check_dac2_frequency_selection(3'd2, 500);
+
+        press_key5();
+        check_dac2_frequency_selection(3'd3, 803);
+
+        press_key5();
+        check_dac2_frequency_selection(3'd4, 1000);
+
+        press_key5();
+        check_dac2_frequency_selection(3'd0, 10);
 
         // The wired DPLL must reacquire a new input while DAC2 keeps the
         // frozen calibration word and remains independent.
         saved_dac2_step = dut.dac2_test_phase_step;
         source_phase = 2.137;
-        source_frequency_hz = 12_000.0;
+        source_frequency_hz = 102_000.0;
         wait (dut.period_locked === 1'b0);
-        wait_for_dpll_lock(12_000.0, 500_000);
+        wait_for_dpll_lock(102_000.0, 500_000);
         if ((dut.dac2_test_phase_step !== saved_dac2_step) ||
             !dut.frequency_cal_locked) begin
             $display("[CHECK FAIL] wired DPLL frequency change altered DAC2 holdover");
             error_count = error_count + 1;
         end else begin
-            $display("[CHECK PASS] DAC1 reacquires 12kHz continuously; DAC2 calibration remains frozen");
+            $display("[CHECK PASS] DAC1 reacquires 102kHz continuously; DAC2 calibration remains frozen");
         end
+
+        // Select the 20.4 kHz fixed DAC2 reference before entering wireless.
+        press_key5();
+        check_dac2_frequency_selection(3'd1, 204);
+        saved_dac2_step = dut.dac2_test_phase_step;
 
         press_key1();
         wait (dut.core_wireless_mode === 1'b1);
+        press_key2();
+        wait (dut.core_wireless_pulse_active === 1'b1);
+        expected_wireless_step =
+            (dut.frequency_cal_phase_step + 5) / 10;
+        if (dut.u_wireless_sawtooth_pulse.active_phase_step !==
+            expected_wireless_step) begin
+            $display("[CHECK FAIL] wireless 10kHz scale step=%0d expected=%0d",
+                     dut.u_wireless_sawtooth_pulse.active_phase_step,
+                     expected_wireless_step);
+            error_count = error_count + 1;
+        end else begin
+            $display("[CHECK PASS] wireless path scales the frozen 100kHz calibration to 10kHz");
+        end
+        wireless_dac2_mismatch_count = 0;
         repeat (6_000) begin
             @(posedge da_clk);
             #1;
-            if (da_data !== da2_data) begin
-                $display("[CHECK FAIL] wireless DAC outputs differ");
-                error_count = error_count + 1;
+            if ((logical_dac_code(da2_data) !==
+                 dut.dac2_test_tone_data) ||
+                (dut.dac2_test_phase_step !==
+                 saved_dac2_step)) begin
+                wireless_dac2_mismatch_count =
+                    wireless_dac2_mismatch_count + 1;
             end
+        end
+        if (wireless_dac2_mismatch_count != 0) begin
+            $display("[CHECK FAIL] wireless recognition altered fixed DAC2 at %0d samples",
+                     wireless_dac2_mismatch_count);
+            error_count = error_count + 1;
+        end else begin
+            $display("[CHECK PASS] wireless recognition changes DAC1 only; DAC2 remains fixed 20.4kHz");
+        end
+
+        press_key6();
+        wait (dut.core_wireless_pulse_active === 1'b0);
+        repeat (10) @(posedge da_clk);
+        if ((dut.core_wireless_mode !== 1'b1) ||
+            (da_data !== 10'd512) ||
+            (logical_dac_code(da2_data) !==
+             dut.dac2_test_tone_data) ||
+            (dut.dac2_test_phase_step !== saved_dac2_step) ||
+            (led_n !== 4'b1110)) begin
+            $display("[CHECK FAIL] KEY6 wireless idle: mode=%0b DAC=%0d/%0d LED=%b",
+                     dut.core_wireless_mode,
+                     da_data,
+                     da2_data,
+                     led_n);
+            error_count = error_count + 1;
+        end else begin
+            $display("[CHECK PASS] KEY6 idles DAC1 while fixed DAC2 continues");
         end
 
         if (error_count == 0) begin

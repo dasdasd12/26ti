@@ -12,6 +12,8 @@ module tb_lissajous_top;
     logic key4_n;
     logic key5_n;
     logic key6_n;
+    logic uart_rx;
+    logic uart_tx;
     logic [9:0] ad_data;
     logic [9:0] ad2_data;
     logic ad_clk;
@@ -65,6 +67,8 @@ module tb_lissajous_top;
         .key4_n(key4_n),
         .key5_n(key5_n),
         .key6_n(key6_n),
+        .uart_rx(uart_rx),
+        .uart_tx(uart_tx),
         .ad_data(ad_data),
         .ad2_data(ad2_data),
         .ad_clk(ad_clk),
@@ -248,6 +252,7 @@ module tb_lissajous_top;
         key4_n = 1'b1;
         key5_n = 1'b1;
         key6_n = 1'b1;
+        uart_rx = 1'b1;
         ad_data = ADC_MID_CODE;
         ad2_data = ADC_MID_CODE;
         source_phase = 0.731;
@@ -317,7 +322,7 @@ module tb_lissajous_top;
         press_key5();
         if ((dut.core_mode_sel !== saved_mode) ||
             (dut.core_amplitude_sel !== saved_amplitude) ||
-            (dut.core_dac2_reference_frequency_sel !== 1'b1)) begin
+            (dut.core_dac2_frequency_sel !== 3'd1)) begin
             $display("[CHECK FAIL] KEY5 changed DAC1 controls");
             error_count = error_count + 1;
         end else begin

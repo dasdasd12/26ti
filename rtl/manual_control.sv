@@ -18,8 +18,11 @@ module manual_control #(
     output logic wireless_mode,
     output logic [1:0] mode_sel,
     output logic [1:0] amplitude_sel,
-    output logic dac2_reference_frequency_sel,
-    output logic frequency_cal_start_pulse
+    output logic dac2_frequency_advance_pulse,
+    output logic frequency_cal_start_pulse,
+    output logic wireless_start_pulse,
+    output logic [1:0] wireless_start_pattern,
+    output logic wireless_abort_pulse
 );
 
     localparam logic [1:0] MODE_DIRECT = 2'd0;
@@ -97,6 +100,22 @@ module manual_control #(
     always @* begin
         frequency_cal_start_pulse =
             !wireless_mode && key4_press;
+        dac2_frequency_advance_pulse =
+            key5_press;
+        wireless_start_pulse =
+            wireless_mode &&
+            (key2_press || key3_press || key4_press);
+        wireless_abort_pulse =
+            wireless_mode && key6_press;
+        if (key2_press) begin
+            wireless_start_pattern = 2'd1;
+        end else if (key3_press) begin
+            wireless_start_pattern = 2'd2;
+        end else if (key4_press) begin
+            wireless_start_pattern = 2'd3;
+        end else begin
+            wireless_start_pattern = 2'd0;
+        end
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -104,8 +123,6 @@ module manual_control #(
             wireless_mode <= 1'b0;
             mode_sel <= MODE_DIRECT;
             amplitude_sel <= AMP_8DIV;
-            // Default DAC2 tone is 97.8 kHz. KEY5 selects calibrated 10 kHz.
-            dac2_reference_frequency_sel <= 1'b0;
         end else begin
             if (key1_press) begin
                 wireless_mode <= ~wireless_mode;
@@ -125,11 +142,6 @@ module manual_control #(
 
                 if (key3_press) begin
                     amplitude_sel <= amplitude_sel + 1'b1;
-                end
-
-                if (key5_press) begin
-                    dac2_reference_frequency_sel <=
-                        ~dac2_reference_frequency_sel;
                 end
             end
         end

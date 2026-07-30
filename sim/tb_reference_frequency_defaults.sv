@@ -3,7 +3,9 @@
 module tb_reference_frequency_defaults;
 
     localparam logic [47:0] EXPECTED_PHASE_STEP =
-        48'd93_824_992_237;
+        48'd938_249_922_369;
+    localparam logic [47:0] EXPECTED_FAST_PHASE_STEP =
+        48'd28_147_497_671_066;
 
     logic clk;
     logic rst_n;
@@ -37,14 +39,16 @@ module tb_reference_frequency_defaults;
         .measured_samples(measured_samples)
     );
 
-    // Keep ten reference cycles per 1 ms block while reducing the simulated
-    // sample rate by 100. This exercises the full default 256-update counter
-    // and averaging path without a multi-million-cycle regression.
+    // Keep ten 100 kHz reference cycles per block at a reduced sample rate.
+    // This exercises the full 256-update weighted estimator without a
+    // multi-million-cycle regression.
     reference_frequency_calibrator #(
-        .SAMPLE_RATE_HZ(300_000),
-        .TARGET_FREQUENCY_HZ(10_000),
-        .BLOCK_SAMPLES(300),
-        .AVERAGING_BLOCKS(256)
+        .SAMPLE_RATE_HZ(1_000_000),
+        .TARGET_FREQUENCY_HZ(100_000),
+        .BLOCK_SAMPLES(100),
+        .AVERAGING_BLOCKS(256),
+        .CORDIC_PRODUCT_SHIFT(0),
+        .MIN_VECTOR_ENERGY(64'd1_000_000)
     ) dut_fast_256 (
         .clk(clk),
         .rst_n(rst_n),
@@ -65,7 +69,7 @@ module tb_reference_frequency_defaults;
                 205.0 * $sin(fast_source_phase);
             fast_input_sample = $rtoi(fast_source_value);
             fast_source_phase =
-                fast_source_phase + 0.20943951023931953;
+                fast_source_phase + 0.6283185307179586;
             if (fast_source_phase >= 6.283185307179586) begin
                 fast_source_phase =
                     fast_source_phase - 6.283185307179586;
@@ -95,13 +99,15 @@ module tb_reference_frequency_defaults;
         if ((dut.BLOCK_SAMPLES != 30_000) ||
             (dut.AVERAGING_BLOCKS != 256) ||
             (dut.NOMINAL_PHASE_STEP !== EXPECTED_PHASE_STEP) ||
-            (dut.STEP_PER_RAD !== 36'd1_493_271_130) ||
+            (dut.WEIGHT_SUM !== 64'd2_829_056) ||
+            (dut.FINAL_DENOMINATOR !== 64'd84_871_680_000) ||
             (dut.TOTAL_MEASUREMENT_SAMPLES !== 64'd7_710_000)) begin
-            $display("[CHECK FAIL] default I/Q calibration constants: block=%0d averages=%0d nominal=%0d scale=%0d samples=%0d",
+            $display("[CHECK FAIL] default I/Q calibration constants: block=%0d averages=%0d nominal=%0d weights=%0d denominator=%0d samples=%0d",
                      dut.BLOCK_SAMPLES,
                      dut.AVERAGING_BLOCKS,
                      dut.NOMINAL_PHASE_STEP,
-                     dut.STEP_PER_RAD,
+                     dut.WEIGHT_SUM,
+                     dut.FINAL_DENOMINATOR,
                      dut.TOTAL_MEASUREMENT_SAMPLES);
             error_count = error_count + 1;
         end else begin
@@ -136,16 +142,18 @@ module tb_reference_frequency_defaults;
         fast_start = 1'b0;
 
         fast_wait_cycles = 0;
-        while (!fast_locked && (fast_wait_cycles < 80_000)) begin
+        while (!fast_locked && (fast_wait_cycles < 40_000)) begin
             @(posedge clk);
             fast_wait_cycles = fast_wait_cycles + 1;
         end
         #1;
 
         if (!fast_locked ||
-            (fast_measured_samples !== 32'd77_100) ||
-            (fast_phase_step < 48'd9_382_499_223_688) ||
-            (fast_phase_step > 48'd9_382_499_223_690)) begin
+            (fast_measured_samples !== 32'd25_700) ||
+            (fast_phase_step <
+             EXPECTED_FAST_PHASE_STEP - 48'd1_000_000) ||
+            (fast_phase_step >
+             EXPECTED_FAST_PHASE_STEP + 48'd1_000_000)) begin
             $display("[CHECK FAIL] 256-update calibration path: locked=%0b samples=%0d step=%0d wait=%0d",
                      fast_locked,
                      fast_measured_samples,

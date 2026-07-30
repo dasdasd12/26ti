@@ -3,16 +3,18 @@
 // Full-sample I/Q frequency calibrator.
 //
 // The ADC input is coherently correlated with a fixed nominal reference NCO.
-// The complex-vector rotation between adjacent blocks measures only frequency
-// error. Multiple block estimates are averaged into one 48-bit DDS word.
-// After lock this module stops updating; the output DDS is therefore fully
-// independent of the reference input.
+// Exact adjacent-block phase increments are obtained with atan2(cross, dot).
+// Parabolic Kay/least-squares weights use every block phase instead of letting
+// an equal sum of adjacent differences collapse to the two endpoint phases.
+// One iterative division at the end converts the weighted phase slope into a
+// frozen 48-bit DDS word.
 module reference_frequency_calibrator #(
     parameter integer SAMPLE_RATE_HZ = 30_000_000,
-    parameter integer TARGET_FREQUENCY_HZ = 10_000,
+    parameter integer TARGET_FREQUENCY_HZ = 100_000,
     parameter integer BLOCK_SAMPLES = SAMPLE_RATE_HZ / 1_000,
     parameter integer AVERAGING_BLOCKS = 256,
     parameter integer CORRELATION_SHIFT = 8,
+    parameter integer CORDIC_PRODUCT_SHIFT = 16,
     parameter logic [63:0] MIN_VECTOR_ENERGY = 64'd100_000_000
 ) (
     input  logic clk,
@@ -30,27 +32,27 @@ module reference_frequency_calibrator #(
         (BLOCK_SAMPLES <= 2) ? 1 : $clog2(BLOCK_SAMPLES);
     localparam integer UPDATE_COUNTER_WIDTH =
         (AVERAGING_BLOCKS <= 2) ? 1 : $clog2(AVERAGING_BLOCKS);
-    localparam integer AVERAGING_SHIFT = $clog2(AVERAGING_BLOCKS);
 
-    localparam logic [63:0] NOMINAL_STEP_NUMERATOR =
-        (64'd1 << 48) * TARGET_FREQUENCY_HZ;
+    // 2^48 * 100 kHz is wider than 64 bits. Keep the constant expression
+    // wide enough before the sample-rate division.
+    localparam logic [79:0] NOMINAL_STEP_NUMERATOR =
+        (80'd1 << 48) * TARGET_FREQUENCY_HZ;
     localparam logic [47:0] NOMINAL_PHASE_STEP =
         (NOMINAL_STEP_NUMERATOR + (SAMPLE_RATE_HZ / 2)) /
         SAMPLE_RATE_HZ;
 
-    // 1/(2*pi) using pi ~= 104348/33215. The approximation error is far
-    // below one 48-bit frequency-word LSB for the configured block sizes.
-    localparam logic [63:0] STEP_PER_RAD_NUMERATOR =
-        (64'd1 << 48) * 64'd33_215;
-    localparam logic [63:0] STEP_PER_RAD_DENOMINATOR =
-        64'd208_696 * BLOCK_SAMPLES;
-    localparam logic [35:0] STEP_PER_RAD =
-        (STEP_PER_RAD_NUMERATOR +
-         (STEP_PER_RAD_DENOMINATOR / 2)) /
-        STEP_PER_RAD_DENOMINATOR;
+    localparam logic [63:0] OBSERVATION_BLOCKS =
+        AVERAGING_BLOCKS + 1;
+    // Sum(k * (N-k)), k=1..N-1, where N is the number of phase
+    // observations. These are the unnormalized least-squares slope weights.
+    localparam logic [63:0] WEIGHT_SUM =
+        (OBSERVATION_BLOCKS *
+         ((OBSERVATION_BLOCKS * OBSERVATION_BLOCKS) - 1)) / 6;
+    localparam logic [63:0] FINAL_DENOMINATOR =
+        WEIGHT_SUM * BLOCK_SAMPLES;
 
-    // The reference is expected to differ only by crystal ppm. Clamp a
-    // single noisy estimate to +/-2000 ppm before averaging.
+    // The reference is expected to differ only by crystal ppm. Clamp the
+    // final correction to +/-2000 ppm.
     localparam logic [63:0] MAX_CORRECTION_STEP =
         NOMINAL_PHASE_STEP / 500;
     localparam logic [63:0] TOTAL_MEASUREMENT_SAMPLES =
@@ -84,28 +86,35 @@ module reference_frequency_calibrator #(
     logic signed [63:0] dot_product_b_reg;
     logic signed [64:0] phase_cross_reg;
     logic signed [64:0] phase_dot_reg;
-    logic [64:0] phase_cross_magnitude_reg;
     logic pair_stage1;
     logic pair_stage2;
     logic pair_stage3;
-    logic numerator_stage;
+
+    logic cordic_start;
+    logic cordic_busy;
+    logic cordic_valid;
+    logic signed [31:0] cordic_x_input;
+    logic signed [31:0] cordic_y_input;
+    logic signed [31:0] cordic_angle;
 
     logic [BLOCK_COUNTER_WIDTH-1:0] block_sample_count;
     logic [UPDATE_COUNTER_WIDTH-1:0] update_count;
+    logic [31:0] weight_index;
+    logic [31:0] current_weight;
+    logic signed [63:0] weighted_angle_product;
+    logic signed [63:0] weighted_angle_sum;
+    logic signed [63:0] weighted_angle_sum_candidate;
+    logic [63:0] weighted_angle_sum_magnitude;
 
-    logic correction_divider_start;
-    logic correction_divider_busy;
-    logic correction_divider_valid;
-    logic correction_pending;
-    logic correction_negative;
-    logic [103:0] correction_numerator_reg;
-    logic [64:0] correction_denominator;
-    logic [103:0] correction_quotient;
+    logic final_divider_pending;
+    logic final_divider_start;
+    logic final_divider_busy;
+    logic final_divider_valid;
+    logic final_correction_negative;
+    logic [79:0] final_divider_numerator;
+    logic [79:0] final_divider_quotient;
     logic [63:0] correction_magnitude;
     logic signed [63:0] correction_value;
-    logic signed [63:0] correction_sum;
-    logic signed [63:0] correction_sum_candidate;
-    logic signed [63:0] average_correction;
     logic signed [63:0] corrected_step_candidate;
 
     initial begin
@@ -117,8 +126,16 @@ module reference_frequency_calibrator #(
               (AVERAGING_BLOCKS - 1)) != 0)) begin
             $error("I/Q calibration block count must be a power of two");
         end
-        if (STEP_PER_RAD_DENOMINATOR == 0) begin
-            $error("I/Q calibration phase scale is invalid");
+        if ((TARGET_FREQUENCY_HZ <= 0) ||
+            (TARGET_FREQUENCY_HZ >= (SAMPLE_RATE_HZ / 2))) begin
+            $error("I/Q calibration frequency is outside the sample band");
+        end
+        if ((CORDIC_PRODUCT_SHIFT < 0) ||
+            (CORDIC_PRODUCT_SHIFT > 31)) begin
+            $error("I/Q calibration CORDIC scaling is invalid");
+        end
+        if ((WEIGHT_SUM == 0) || (FINAL_DENOMINATOR == 0)) begin
+            $error("I/Q calibration least-squares scale is invalid");
         end
         if (TOTAL_MEASUREMENT_SAMPLES > 64'hffff_ffff) begin
             $error("I/Q calibration sample count exceeds 32 bits");
@@ -139,6 +156,31 @@ module reference_frequency_calibrator #(
         .sine_sample(reference_cosine)
     );
 
+    cordic_atan2 u_frequency_error_cordic (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(cordic_start),
+        .x_in(cordic_x_input),
+        .y_in(cordic_y_input),
+        .busy(cordic_busy),
+        .valid(cordic_valid),
+        .angle(cordic_angle)
+    );
+
+    unsigned_fraction_divider #(
+        .NUMERATOR_WIDTH(80),
+        .DENOMINATOR_WIDTH(64)
+    ) u_final_frequency_error_divider (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(final_divider_start),
+        .numerator(final_divider_numerator),
+        .denominator(FINAL_DENOMINATOR),
+        .busy(final_divider_busy),
+        .valid(final_divider_valid),
+        .quotient(final_divider_quotient)
+    );
+
     always @* begin
         in_phase_product = input_sample * reference_sine;
         quadrature_product = input_sample * reference_cosine;
@@ -151,38 +193,40 @@ module reference_frequency_calibrator #(
         current_q_vector =
             quadrature_complete >>> CORRELATION_SHIFT;
 
-        if (correction_quotient > MAX_CORRECTION_STEP) begin
+        weight_index = update_count + 1'b1;
+        current_weight =
+            weight_index *
+            (OBSERVATION_BLOCKS[31:0] - weight_index);
+        weighted_angle_product =
+            $signed(cordic_angle) *
+            $signed({1'b0, current_weight});
+        weighted_angle_sum_candidate =
+            weighted_angle_sum + weighted_angle_product;
+        if (weighted_angle_sum_candidate < 0) begin
+            weighted_angle_sum_magnitude =
+                -weighted_angle_sum_candidate;
+        end else begin
+            weighted_angle_sum_magnitude =
+                weighted_angle_sum_candidate;
+        end
+
+        if ((final_divider_quotient[79:64] != 0) ||
+            (final_divider_quotient[63:0] >
+             MAX_CORRECTION_STEP)) begin
             correction_magnitude = MAX_CORRECTION_STEP;
         end else begin
-            correction_magnitude = correction_quotient[63:0];
+            correction_magnitude =
+                final_divider_quotient[63:0];
         end
-        if (correction_negative) begin
+        if (final_correction_negative) begin
             correction_value = -$signed(correction_magnitude);
         end else begin
             correction_value = $signed(correction_magnitude);
         end
-        correction_sum_candidate =
-            correction_sum + correction_value;
-        average_correction =
-            correction_sum_candidate >>> AVERAGING_SHIFT;
         corrected_step_candidate =
             $signed({16'd0, NOMINAL_PHASE_STEP}) +
-            average_correction;
+            correction_value;
     end
-
-    unsigned_fraction_divider #(
-        .NUMERATOR_WIDTH(104),
-        .DENOMINATOR_WIDTH(65)
-    ) u_frequency_error_divider (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(correction_divider_start),
-        .numerator(correction_numerator_reg),
-        .denominator(correction_denominator),
-        .busy(correction_divider_busy),
-        .valid(correction_divider_valid),
-        .quotient(correction_quotient)
-    );
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -206,25 +250,25 @@ module reference_frequency_calibrator #(
             dot_product_b_reg <= 64'sd0;
             phase_cross_reg <= 65'sd0;
             phase_dot_reg <= 65'sd0;
-            phase_cross_magnitude_reg <= 65'd0;
             pair_stage1 <= 1'b0;
             pair_stage2 <= 1'b0;
             pair_stage3 <= 1'b0;
-            numerator_stage <= 1'b0;
+            cordic_start <= 1'b0;
+            cordic_x_input <= 32'sd0;
+            cordic_y_input <= 32'sd0;
             block_sample_count <= '0;
             update_count <= '0;
-            correction_divider_start <= 1'b0;
-            correction_pending <= 1'b0;
-            correction_negative <= 1'b0;
-            correction_numerator_reg <= 104'd0;
-            correction_denominator <= 65'd1;
-            correction_sum <= 64'sd0;
+            weighted_angle_sum <= 64'sd0;
+            final_divider_pending <= 1'b0;
+            final_divider_start <= 1'b0;
+            final_correction_negative <= 1'b0;
+            final_divider_numerator <= 80'd0;
         end else begin
-            correction_divider_start <= 1'b0;
             pair_stage1 <= 1'b0;
             pair_stage2 <= 1'b0;
             pair_stage3 <= 1'b0;
-            numerator_stage <= 1'b0;
+            cordic_start <= 1'b0;
+            final_divider_start <= 1'b0;
 
             if (start) begin
                 active <= 1'b1;
@@ -247,17 +291,14 @@ module reference_frequency_calibrator #(
                 dot_product_b_reg <= 64'sd0;
                 phase_cross_reg <= 65'sd0;
                 phase_dot_reg <= 65'sd0;
-                phase_cross_magnitude_reg <= 65'd0;
-                pair_stage1 <= 1'b0;
-                pair_stage2 <= 1'b0;
-                pair_stage3 <= 1'b0;
-                numerator_stage <= 1'b0;
+                cordic_x_input <= 32'sd0;
+                cordic_y_input <= 32'sd0;
                 block_sample_count <= '0;
                 update_count <= '0;
-                correction_pending <= 1'b0;
-                correction_numerator_reg <= 104'd0;
-                correction_denominator <= 65'd1;
-                correction_sum <= 64'sd0;
+                weighted_angle_sum <= 64'sd0;
+                final_divider_pending <= 1'b0;
+                final_correction_negative <= 1'b0;
+                final_divider_numerator <= 80'd0;
             end else begin
                 if (active && !locked && sample_ce) begin
                     reference_phase_accumulator <=
@@ -274,20 +315,16 @@ module reference_frequency_calibrator #(
                         previous_vector_valid <= 1'b1;
 
                         if (previous_vector_valid &&
-                            !correction_divider_busy &&
-                            !correction_pending &&
+                            !cordic_busy &&
+                            !final_divider_busy &&
+                            !final_divider_pending &&
                             !pair_stage1 &&
                             !pair_stage2 &&
-                            !pair_stage3 &&
-                            !numerator_stage) begin
-                            pair_current_i_reg <=
-                                current_i_vector;
-                            pair_current_q_reg <=
-                                current_q_vector;
-                            pair_previous_i_reg <=
-                                previous_i_vector;
-                            pair_previous_q_reg <=
-                                previous_q_vector;
+                            !pair_stage3) begin
+                            pair_current_i_reg <= current_i_vector;
+                            pair_current_q_reg <= current_q_vector;
+                            pair_previous_i_reg <= previous_i_vector;
+                            pair_previous_q_reg <= previous_q_vector;
                             pair_stage1 <= 1'b1;
                         end
                     end else begin
@@ -300,10 +337,6 @@ module reference_frequency_calibrator #(
                     end
                 end
 
-                // The original cross/dot/magnitude/scale expression formed
-                // one very long path. These stages have tens of thousands of
-                // idle clocks between correlation blocks, so pipelining costs
-                // no measurement throughput.
                 if (pair_stage1) begin
                     cross_product_a_reg <=
                         pair_previous_i_reg *
@@ -337,48 +370,47 @@ module reference_frequency_calibrator #(
                 if (pair_stage3) begin
                     if (!phase_dot_reg[64] &&
                         (phase_dot_reg[64:0] >=
-                         MIN_VECTOR_ENERGY)) begin
-                        if (phase_cross_reg[64]) begin
-                            phase_cross_magnitude_reg <=
-                                (~phase_cross_reg) + 1'b1;
-                        end else begin
-                            phase_cross_magnitude_reg <=
-                                phase_cross_reg[64:0];
-                        end
-                        correction_negative <=
-                            phase_cross_reg[64];
-                        correction_denominator <=
-                            phase_dot_reg[64:0];
-                        numerator_stage <= 1'b1;
+                         MIN_VECTOR_ENERGY) &&
+                        !cordic_busy) begin
+                        cordic_x_input <=
+                            phase_dot_reg >> CORDIC_PRODUCT_SHIFT;
+                        cordic_y_input <=
+                            $signed(phase_cross_reg) >>>
+                            CORDIC_PRODUCT_SHIFT;
+                        cordic_start <= 1'b1;
                     end
                 end
 
-                if (numerator_stage) begin
-                    correction_numerator_reg <=
-                        {{39{1'b0}},
-                         phase_cross_magnitude_reg} *
-                        {{68{1'b0}}, STEP_PER_RAD};
-                    correction_divider_start <= 1'b1;
-                    correction_pending <= 1'b1;
-                end
-
-                if (correction_divider_valid &&
-                    correction_pending) begin
-                    correction_pending <= 1'b0;
-                    correction_sum <= correction_sum_candidate;
-
+                if (cordic_valid) begin
+                    weighted_angle_sum <=
+                        weighted_angle_sum_candidate;
                     if (update_count ==
                         AVERAGING_BLOCKS - 1) begin
-                        if (corrected_step_candidate >
-                            64'sd0) begin
-                            phase_step <=
-                                corrected_step_candidate[47:0];
-                            locked <= 1'b1;
-                            measured_samples <=
-                                TOTAL_MEASUREMENT_SAMPLES[31:0];
-                        end
+                        final_correction_negative <=
+                            weighted_angle_sum_candidate < 0;
+                        final_divider_numerator <=
+                            ({weighted_angle_sum_magnitude,
+                              16'd0}) +
+                            (FINAL_DENOMINATOR / 2);
+                        final_divider_pending <= 1'b1;
                     end else begin
                         update_count <= update_count + 1'b1;
+                    end
+                end
+
+                if (final_divider_pending &&
+                    !final_divider_busy) begin
+                    final_divider_start <= 1'b1;
+                    final_divider_pending <= 1'b0;
+                end
+
+                if (final_divider_valid) begin
+                    if (corrected_step_candidate > 0) begin
+                        phase_step <=
+                            corrected_step_candidate[47:0];
+                        locked <= 1'b1;
+                        measured_samples <=
+                            TOTAL_MEASUREMENT_SAMPLES[31:0];
                     end
                 end
             end

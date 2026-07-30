@@ -18,11 +18,10 @@ module lissajous_top #(
     // 6.398 samples: four registered digital stages plus the measured
     // approximately 2.4-sample board-level high-frequency delay.
     parameter integer PHASE_PIPELINE_COMP_Q8 = 1_638,
+    parameter integer FREQUENCY_CAL_TARGET_HZ = 100_000,
     parameter integer FREQUENCY_CAL_BLOCK_SAMPLES =
         CONVERTER_CLK_HZ / 1_000,
     parameter integer FREQUENCY_CAL_AVERAGING_BLOCKS = 256,
-    parameter integer WIRED_TEST_TONE_SCALE_NUMERATOR = 489,
-    parameter integer WIRED_TEST_TONE_SCALE_DENOMINATOR = 50,
     parameter integer DPLL_MIN_FREQUENCY_HZ = 1_000,
     parameter integer DPLL_MAX_FREQUENCY_HZ = 110_000,
     parameter integer DPLL_COARSE_STEP_HZ = 1_000,
@@ -41,9 +40,13 @@ module lissajous_top #(
     input  logic key1_n,            // mode change
     input  logic key2_n,            // waveform change or line pattern when in wireless mode
     input  logic key3_n,            // amplitude change or circular pattern when in wireless mode
-    input  logic key4_n,            // start 10 kHz frequency calibration
-    input  logic key5_n,            // DAC2: 97.8 kHz / 10 kHz
+    input  logic key4_n,            // start 100 kHz frequency calibration
+    input  logic key5_n,            // cycle DAC2 calibration test frequencies
     input  logic key6_n,            // reserved
+
+    input  logic uart_rx,           // 921600-baud wireless host receive
+    output logic uart_tx,           // 921600-baud wireless host transmit
+    // output logic buzzer_en,         // active-high DONE sound indication
 
     input  logic [9:0] ad_data,     // ADC data input
     input  logic [9:0] ad2_data,    // ADC feedback data input
@@ -59,7 +62,7 @@ module lissajous_top #(
 
     output logic [3:0] led_n
 );
-
+    logic buzzer_en;
     logic sample_ce;
 
     assign sample_ce = 1'b1;
@@ -114,7 +117,10 @@ module lissajous_top #(
     logic [1:0] mode_sel;
     logic [1:0] amplitude_sel;
     logic frequency_cal_start_pulse;
-    logic dac2_reference_frequency_sel;
+    logic dac2_frequency_advance_pulse;
+    logic wireless_start_pulse;
+    logic [1:0] wireless_start_pattern;
+    logic wireless_abort_pulse;
     (* mark_debug = "true", keep = "true" *)
     logic frequency_cal_active;
     (* mark_debug = "true", keep = "true" *)
@@ -140,14 +146,91 @@ module lissajous_top #(
         .wireless_mode(wireless_mode),
         .mode_sel(mode_sel),
         .amplitude_sel(amplitude_sel),
-        .dac2_reference_frequency_sel(
-            dac2_reference_frequency_sel),
-        .frequency_cal_start_pulse(frequency_cal_start_pulse)
+        .dac2_frequency_advance_pulse(
+            dac2_frequency_advance_pulse),
+        .frequency_cal_start_pulse(frequency_cal_start_pulse),
+        .wireless_start_pulse(wireless_start_pulse),
+        .wireless_start_pattern(wireless_start_pattern),
+        .wireless_abort_pulse(wireless_abort_pulse)
     );
+
+    logic [2:0] wireless_state;
+    logic [1:0] wireless_active_pattern;
+    logic wireless_pulse_active;
+    logic wireless_sine_active;
+    logic wireless_done;
+    logic [31:0] wireless_frequency_millihz;
+    logic [15:0] wireless_phase_q16;
+    logic wireless_frequency_update_pulse;
+    logic wireless_phase_update_pulse;
+    logic uart_rx_framing_error;
+    logic uart_packet_crc_error;
+    logic uart_packet_protocol_error;
+    logic wireless_scan_led;
+    logic frequency_cal_locked_meta_sys;
+    logic frequency_cal_locked_sys;
+
+    always_ff @(posedge sys_clk_100m or negedge rst_n) begin
+        if (!rst_n) begin
+            frequency_cal_locked_meta_sys <= 1'b0;
+            frequency_cal_locked_sys <= 1'b0;
+        end else begin
+            frequency_cal_locked_meta_sys <= frequency_cal_locked;
+            frequency_cal_locked_sys <=
+                frequency_cal_locked_meta_sys;
+        end
+    end
+
+    wireless_uart_controller #(
+        .CLOCK_HZ(SYS_CLK_HZ),
+        .BAUD_RATE(921_600)
+    ) u_wireless_uart_controller (
+        .clk(sys_clk_100m),
+        .rst_n(rst_n),
+        .wireless_mode(wireless_mode),
+        .calibration_valid(frequency_cal_locked_sys),
+        .wireless_start_pulse(wireless_start_pulse),
+        .wireless_start_pattern(wireless_start_pattern),
+        .wireless_abort_pulse(wireless_abort_pulse),
+        .uart_rx(uart_rx),
+        .uart_tx(uart_tx),
+        .wireless_state(wireless_state),
+        .active_pattern(wireless_active_pattern),
+        .wireless_pulse_active(wireless_pulse_active),
+        .wireless_sine_active(wireless_sine_active),
+        .wireless_done(wireless_done),
+        .frequency_millihz(wireless_frequency_millihz),
+        .phase_q16(wireless_phase_q16),
+        .frequency_update_pulse(
+            wireless_frequency_update_pulse),
+        .phase_update_pulse(
+            wireless_phase_update_pulse),
+        .uart_rx_framing_error(uart_rx_framing_error),
+        .uart_packet_crc_error(uart_packet_crc_error),
+        .uart_packet_protocol_error(
+            uart_packet_protocol_error)
+    );
+
+    assign wireless_scan_led =
+        (wireless_state == 3'd2) ||
+        (wireless_state == 3'd3);
+    assign buzzer_en =
+        wireless_mode &&
+        frequency_cal_locked_sys &&
+        wireless_done;
 
     status_leds u_status_leds (
         .wireless_mode(wireless_mode),
-        .frequency_cal_locked(frequency_cal_locked),
+        .frequency_cal_locked(frequency_cal_locked_sys),
+        .wireless_pulse_active(
+            wireless_pulse_active &&
+            frequency_cal_locked_sys),
+        .wireless_scan_active(
+            wireless_scan_led &&
+            frequency_cal_locked_sys),
+        .wireless_done(
+            wireless_done &&
+            frequency_cal_locked_sys),
         .led_n(led_n)
     );
 
@@ -163,8 +246,6 @@ module lissajous_top #(
     logic [1:0] core_mode_sel;
     logic [1:0] core_amplitude_sel_meta;
     logic [1:0] core_amplitude_sel;
-    logic core_dac2_reference_frequency_sel_meta;
-    logic core_dac2_reference_frequency_sel;
 
     always_ff @(posedge converter_clk_30m or negedge converter_rst_n) begin
         if (!converter_rst_n) begin
@@ -180,8 +261,6 @@ module lissajous_top #(
             // amplitude selection
             core_amplitude_sel_meta <= 2'd3;
             core_amplitude_sel <= 2'd3;
-            core_dac2_reference_frequency_sel_meta <= 1'b0;
-            core_dac2_reference_frequency_sel <= 1'b0;
 
         end else begin
 
@@ -194,30 +273,38 @@ module lissajous_top #(
 
             core_amplitude_sel_meta <= amplitude_sel;
             core_amplitude_sel <= core_amplitude_sel_meta;
-            core_dac2_reference_frequency_sel_meta <=
-                dac2_reference_frequency_sel;
-            core_dac2_reference_frequency_sel <=
-                core_dac2_reference_frequency_sel_meta;
 
         end
     end
 
-    // KEY4 event transfer
+    // KEY4/KEY5 event transfer
 
     logic frequency_cal_start_toggle;
+    logic dac2_frequency_advance_toggle;
 
     logic frequency_cal_start_toggle_meta;
     logic frequency_cal_start_toggle_sync;
     logic frequency_cal_start_toggle_d;
     logic core_frequency_cal_start_pulse;
+    logic dac2_frequency_advance_toggle_meta;
+    logic dac2_frequency_advance_toggle_sync;
+    logic dac2_frequency_advance_toggle_d;
+    logic core_dac2_frequency_advance_pulse;
+    (* mark_debug = "true", keep = "true" *)
+    logic [2:0] core_dac2_frequency_sel;
 
     always_ff @(posedge sys_clk_100m or negedge rst_n) begin
         if (!rst_n) begin
             frequency_cal_start_toggle <= 1'b0;
+            dac2_frequency_advance_toggle <= 1'b0;
         end else begin
             if (frequency_cal_start_pulse) begin
                 frequency_cal_start_toggle <=
                     ~frequency_cal_start_toggle;
+            end
+            if (dac2_frequency_advance_pulse) begin
+                dac2_frequency_advance_toggle <=
+                    ~dac2_frequency_advance_toggle;
             end
         end
     end
@@ -227,6 +314,9 @@ module lissajous_top #(
             frequency_cal_start_toggle_meta <= 1'b0;
             frequency_cal_start_toggle_sync <= 1'b0;
             frequency_cal_start_toggle_d <= 1'b0;
+            dac2_frequency_advance_toggle_meta <= 1'b0;
+            dac2_frequency_advance_toggle_sync <= 1'b0;
+            dac2_frequency_advance_toggle_d <= 1'b0;
         end else begin
             frequency_cal_start_toggle_meta <=
                 frequency_cal_start_toggle;
@@ -234,12 +324,136 @@ module lissajous_top #(
                 frequency_cal_start_toggle_meta;
             frequency_cal_start_toggle_d <=
                 frequency_cal_start_toggle_sync;
+            dac2_frequency_advance_toggle_meta <=
+                dac2_frequency_advance_toggle;
+            dac2_frequency_advance_toggle_sync <=
+                dac2_frequency_advance_toggle_meta;
+            dac2_frequency_advance_toggle_d <=
+                dac2_frequency_advance_toggle_sync;
         end
     end
 
     assign core_frequency_cal_start_pulse =
         frequency_cal_start_toggle_sync ^
         frequency_cal_start_toggle_d;
+    assign core_dac2_frequency_advance_pulse =
+        dac2_frequency_advance_toggle_sync ^
+        dac2_frequency_advance_toggle_d;
+
+    // UART frequency/phase setpoints cross into the converter clock domain
+    // through event toggles.  The multi-bit buses are persistent and have
+    // already been stable for multiple converter clocks when captured.
+    logic wireless_frequency_update_toggle;
+    logic wireless_phase_update_toggle;
+    logic wireless_frequency_update_toggle_meta;
+    logic wireless_frequency_update_toggle_sync;
+    logic wireless_frequency_update_toggle_d;
+    logic wireless_phase_update_toggle_meta;
+    logic wireless_phase_update_toggle_sync;
+    logic wireless_phase_update_toggle_d;
+    logic core_wireless_frequency_update_pulse;
+    logic core_wireless_phase_update_pulse;
+    logic core_wireless_frequency_apply_pulse;
+    logic core_wireless_phase_apply_pulse;
+    logic core_wireless_pulse_active_meta;
+    logic core_wireless_pulse_active;
+    logic core_wireless_sine_active_meta;
+    logic core_wireless_sine_active;
+    logic [31:0] core_wireless_frequency_millihz;
+    logic [15:0] core_wireless_phase_q16;
+
+    always_ff @(posedge sys_clk_100m or negedge rst_n) begin
+        if (!rst_n) begin
+            wireless_frequency_update_toggle <= 1'b0;
+            wireless_phase_update_toggle <= 1'b0;
+        end else begin
+            if (wireless_frequency_update_pulse) begin
+                wireless_frequency_update_toggle <=
+                    ~wireless_frequency_update_toggle;
+            end
+            if (wireless_phase_update_pulse) begin
+                wireless_phase_update_toggle <=
+                    ~wireless_phase_update_toggle;
+            end
+        end
+    end
+
+    always_ff @(posedge converter_clk_30m or
+                negedge converter_rst_n) begin
+        if (!converter_rst_n) begin
+            wireless_frequency_update_toggle_meta <= 1'b0;
+            wireless_frequency_update_toggle_sync <= 1'b0;
+            wireless_frequency_update_toggle_d <= 1'b0;
+            wireless_phase_update_toggle_meta <= 1'b0;
+            wireless_phase_update_toggle_sync <= 1'b0;
+            wireless_phase_update_toggle_d <= 1'b0;
+            core_wireless_pulse_active_meta <= 1'b0;
+            core_wireless_pulse_active <= 1'b0;
+            core_wireless_sine_active_meta <= 1'b0;
+            core_wireless_sine_active <= 1'b0;
+            core_wireless_frequency_millihz <= 32'd0;
+            core_wireless_phase_q16 <= 16'd0;
+            core_wireless_frequency_apply_pulse <= 1'b0;
+            core_wireless_phase_apply_pulse <= 1'b0;
+        end else begin
+            wireless_frequency_update_toggle_meta <=
+                wireless_frequency_update_toggle;
+            wireless_frequency_update_toggle_sync <=
+                wireless_frequency_update_toggle_meta;
+            wireless_frequency_update_toggle_d <=
+                wireless_frequency_update_toggle_sync;
+            wireless_phase_update_toggle_meta <=
+                wireless_phase_update_toggle;
+            wireless_phase_update_toggle_sync <=
+                wireless_phase_update_toggle_meta;
+            wireless_phase_update_toggle_d <=
+                wireless_phase_update_toggle_sync;
+            core_wireless_pulse_active_meta <=
+                wireless_pulse_active;
+            core_wireless_pulse_active <=
+                core_wireless_pulse_active_meta;
+            core_wireless_sine_active_meta <=
+                wireless_sine_active;
+            core_wireless_sine_active <=
+                core_wireless_sine_active_meta;
+            // Capture the persistent multi-bit bus first, then apply it to
+            // the DDS one converter clock later.  Without this register the
+            // DDS sees the previous frequency/phase on the event edge.
+            core_wireless_frequency_apply_pulse <=
+                core_wireless_frequency_update_pulse;
+            core_wireless_phase_apply_pulse <=
+                core_wireless_phase_update_pulse;
+
+            if (core_wireless_frequency_update_pulse) begin
+                core_wireless_frequency_millihz <=
+                    wireless_frequency_millihz;
+            end
+            if (core_wireless_phase_update_pulse) begin
+                core_wireless_phase_q16 <=
+                    wireless_phase_q16;
+            end
+        end
+    end
+
+    assign core_wireless_frequency_update_pulse =
+        wireless_frequency_update_toggle_sync ^
+        wireless_frequency_update_toggle_d;
+    assign core_wireless_phase_update_pulse =
+        wireless_phase_update_toggle_sync ^
+        wireless_phase_update_toggle_d;
+
+    always_ff @(posedge converter_clk_30m or negedge converter_rst_n) begin
+        if (!converter_rst_n) begin
+            core_dac2_frequency_sel <= 3'd0;
+        end else if (core_dac2_frequency_advance_pulse) begin
+            if (core_dac2_frequency_sel == 3'd4) begin
+                core_dac2_frequency_sel <= 3'd0;
+            end else begin
+                core_dac2_frequency_sel <=
+                    core_dac2_frequency_sel + 1'b1;
+            end
+        end
+    end
 
     // The PLL already generates the required 30 MHz converter clock, so no
     // fabric divider or clock feedback path is needed. Each ODDR drives exactly
@@ -305,6 +519,9 @@ module lissajous_top #(
 
     logic [9:0] core_da_data;
     logic [9:0] wireless_sawtooth_data;
+    logic [9:0] wireless_sine_data;
+    logic [47:0] wireless_sine_phase_step;
+    logic wireless_sine_phase_step_valid;
     logic [9:0] dac2_test_tone_data;
     localparam logic [9:0] DAC_IDLE_RAW_CODE =
         DAC_MID_CODE[9:0];
@@ -327,6 +544,8 @@ module lissajous_top #(
 
     wireless_sawtooth_pulse #(
         .SAMPLE_RATE_HZ(CONVERTER_CLK_HZ),
+        .CALIBRATION_FREQUENCY_HZ(
+            FREQUENCY_CAL_TARGET_HZ),
         .PULSE_FREQUENCY_HZ(WIRELESS_PULSE_FREQUENCY_HZ),
         .BURST_PERIOD_SAMPLES(WIRELESS_BURST_PERIOD_SAMPLES),
         .LOW_CODE(DAC_MID_CODE - ADC_CAL_PEAK_CODE),
@@ -334,26 +553,53 @@ module lissajous_top #(
     ) u_wireless_sawtooth_pulse (
         .clk(converter_clk_30m),
         .rst_n(converter_rst_n),
-        .enable(core_wireless_mode),
+        .enable(core_wireless_mode &&
+                core_wireless_pulse_active &&
+                frequency_cal_locked),
         .frequency_cal_valid(frequency_cal_locked),
         .calibrated_phase_step(frequency_cal_phase_step),
         .sawtooth_data(wireless_sawtooth_data)
     );
 
+    wireless_commanded_dds #(
+        .CALIBRATION_FREQUENCY_MILLIHZ(
+            FREQUENCY_CAL_TARGET_HZ * 1000),
+        .DAC_MID_CODE(DAC_MID_CODE),
+        .DAC_PEAK_CODE(ADC_CAL_PEAK_CODE)
+    ) u_wireless_commanded_dds (
+        .clk(converter_clk_30m),
+        .rst_n(converter_rst_n),
+        .sample_ce(sample_ce),
+        .enable(core_wireless_mode &&
+                core_wireless_sine_active &&
+                frequency_cal_locked),
+        .calibration_valid(frequency_cal_locked),
+        .calibrated_phase_step(frequency_cal_phase_step),
+        .frequency_millihz(
+            core_wireless_frequency_millihz),
+        .phase_q16(core_wireless_phase_q16),
+        .frequency_update_pulse(
+            core_wireless_frequency_apply_pulse),
+        .phase_update_pulse(
+            core_wireless_phase_apply_pulse),
+        .sine_data(wireless_sine_data),
+        .phase_step(wireless_sine_phase_step),
+        .phase_step_valid(wireless_sine_phase_step_valid)
+    );
+
     calibrated_sine_test_tone #(
-        .SCALE_NUMERATOR(
-            WIRED_TEST_TONE_SCALE_NUMERATOR),
-        .SCALE_DENOMINATOR(
-            WIRED_TEST_TONE_SCALE_DENOMINATOR),
+        .CALIBRATION_FREQUENCY_HZ(
+            FREQUENCY_CAL_TARGET_HZ),
         .DAC_MID_CODE(DAC_MID_CODE),
         .DAC_PEAK_CODE(ADC_CAL_PEAK_CODE)
     ) u_calibrated_sine_test_tone (
         .clk(converter_clk_30m),
         .rst_n(converter_rst_n),
         .sample_ce(sample_ce),
-        .enable(frequency_cal_locked && !core_wireless_mode),
-        .use_reference_frequency(
-            core_dac2_reference_frequency_sel),
+        // DAC2 is an independent fixed-frequency calibration output in both
+        // wired and wireless modes.  Wireless SCAN commands never alter it.
+        .enable(frequency_cal_locked),
+        .frequency_sel(core_dac2_frequency_sel),
         .calibrated_phase_step(frequency_cal_phase_step),
         .tone_phase_step(dac2_test_phase_step),
         .tone_data(dac2_test_tone_data)
@@ -374,6 +620,8 @@ module lissajous_top #(
         .DAC_MID_CODE(DAC_MID_CODE),
         .PHASE_PIPELINE_COMP_Q8(
             PHASE_PIPELINE_COMP_Q8),
+        .FREQUENCY_CAL_TARGET_HZ(
+            FREQUENCY_CAL_TARGET_HZ),
         .FREQUENCY_CAL_BLOCK_SAMPLES(
             FREQUENCY_CAL_BLOCK_SAMPLES),
         .FREQUENCY_CAL_AVERAGING_BLOCKS(
@@ -431,20 +679,29 @@ module lissajous_top #(
 
     always @* begin
         // The external analog output stage inverts polarity. Apply the same
-        // digital inversion to DDS data and the wireless sawtooth so the final
-        // analog signal has the requested polarity. In the normal hardware
-        // DAC1 is always the normal wired full-sample DPLL output. The KEY4
-        // frequency-only calibration path is isolated to DAC2/wireless use.
+        // digital inversion to every active path.  DAC1 changes function with
+        // the wired/wireless state.  DAC2 remains the independent KEY5
+        // calibrated test tone and is never overwritten by wireless SCAN.
+        da_data = DAC_IDLE_RAW_CODE;
+        da2_data = DAC_IDLE_RAW_CODE;
+
         if (core_wireless_mode) begin
-            da_data = invert_dac_code(wireless_sawtooth_data);
-            da2_data = invert_dac_code(wireless_sawtooth_data);
+            if (frequency_cal_locked) begin
+                da2_data =
+                    invert_dac_code(dac2_test_tone_data);
+                if (core_wireless_pulse_active) begin
+                    da_data =
+                        invert_dac_code(wireless_sawtooth_data);
+                end else if (core_wireless_sine_active) begin
+                    da_data =
+                        invert_dac_code(wireless_sine_data);
+                end
+            end
         end else begin
             da_data = invert_dac_code(core_da_data);
             if (frequency_cal_locked) begin
                 da2_data =
                     invert_dac_code(dac2_test_tone_data);
-            end else begin
-                da2_data = DAC_IDLE_RAW_CODE;
             end
         end
     end

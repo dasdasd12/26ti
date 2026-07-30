@@ -2,6 +2,7 @@
 /icarus/
 /sim/*.vcd
 /sim/*.fst
+/sim/*.out
 /build/
 /.Xil/
 /hs_err_pid*.dmp

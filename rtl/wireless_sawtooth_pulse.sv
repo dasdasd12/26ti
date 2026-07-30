@@ -2,6 +2,7 @@
 
 module wireless_sawtooth_pulse #(
     parameter integer SAMPLE_RATE_HZ = 30_000_000,
+    parameter integer CALIBRATION_FREQUENCY_HZ = 100_000,
     parameter integer PULSE_FREQUENCY_HZ = 10_000,
     parameter integer BURST_PERIOD_SAMPLES = SAMPLE_RATE_HZ / 100,
     parameter integer LOW_CODE = 307,
@@ -22,13 +23,21 @@ module wireless_sawtooth_pulse #(
         BURST_PERIOD_SAMPLES / RAMP_SAMPLES;
     localparam integer CYCLE_COUNTER_WIDTH =
         (BURST_CYCLES <= 2) ? 1 : $clog2(BURST_CYCLES);
-    localparam logic [63:0] NOMINAL_STEP_NUMERATOR =
-        (64'd1 << 48) * PULSE_FREQUENCY_HZ;
-    localparam logic [47:0] NOMINAL_PHASE_STEP =
-        (NOMINAL_STEP_NUMERATOR + (SAMPLE_RATE_HZ / 2)) /
-        SAMPLE_RATE_HZ;
+    localparam logic [63:0] PULSE_FREQUENCY_HZ_U =
+        PULSE_FREQUENCY_HZ;
+    localparam logic [31:0] CALIBRATION_FREQUENCY_HZ_U =
+        CALIBRATION_FREQUENCY_HZ;
 
     logic [47:0] active_phase_step;
+    logic [47:0] calibrated_phase_step_d;
+    logic [63:0] scaled_step_numerator_reg;
+    logic [63:0] scaled_step_quotient;
+    logic [47:0] scaled_pulse_phase_step_reg;
+    logic scaler_request;
+    logic scaler_start;
+    logic scaler_busy;
+    logic scaler_valid;
+    logic scaled_step_valid;
     logic [47:0] phase_accumulator;
     logic [48:0] phase_sum;
     logic [CYCLE_COUNTER_WIDTH-1:0] cycle_count;
@@ -41,10 +50,13 @@ module wireless_sawtooth_pulse #(
 
     always @* begin
         if (frequency_cal_valid &&
-            (calibrated_phase_step != 48'd0)) begin
-            active_phase_step = calibrated_phase_step;
+            scaled_step_valid &&
+            (scaled_pulse_phase_step_reg != 48'd0)) begin
+            active_phase_step = scaled_pulse_phase_step_reg;
         end else begin
-            active_phase_step = NOMINAL_PHASE_STEP;
+            // There is intentionally no nominal-clock fallback.  Wireless
+            // outputs are permitted only after frequency calibration.
+            active_phase_step = 48'd0;
         end
 
         phase_sum =
@@ -68,6 +80,12 @@ module wireless_sawtooth_pulse #(
         if ((SAMPLE_RATE_HZ % PULSE_FREQUENCY_HZ) != 0) begin
             $error("Wireless sawtooth requires an integer nominal period");
         end
+        if ((CALIBRATION_FREQUENCY_HZ <= 0) ||
+            (PULSE_FREQUENCY_HZ <= 0) ||
+            (PULSE_FREQUENCY_HZ >
+             CALIBRATION_FREQUENCY_HZ)) begin
+            $error("Wireless sawtooth calibration scale is invalid");
+        end
         if ((BURST_PERIOD_SAMPLES % RAMP_SAMPLES) != 0) begin
             $error("Wireless burst period must contain whole 10 kHz cycles");
         end
@@ -80,23 +98,67 @@ module wireless_sawtooth_pulse #(
         end
     end
 
+    unsigned_fraction_divider #(
+        .NUMERATOR_WIDTH(64),
+        .DENOMINATOR_WIDTH(32)
+    ) u_calibrated_step_scaler (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(scaler_start),
+        .numerator(scaled_step_numerator_reg),
+        .denominator(CALIBRATION_FREQUENCY_HZ_U),
+        .busy(scaler_busy),
+        .valid(scaler_valid),
+        .quotient(scaled_step_quotient)
+    );
+
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            phase_accumulator <= 48'd0;
-            cycle_count <= '0;
-            sawtooth_data <= HIGH_CODE[9:0];
-        end else if (!enable) begin
+            calibrated_phase_step_d <= 48'd0;
+            scaled_step_numerator_reg <= 64'd0;
+            scaled_pulse_phase_step_reg <= 48'd0;
+            scaler_request <= 1'b0;
+            scaler_start <= 1'b0;
+            scaled_step_valid <= 1'b0;
             phase_accumulator <= 48'd0;
             cycle_count <= '0;
             sawtooth_data <= HIGH_CODE[9:0];
         end else begin
-            phase_accumulator <= phase_sum[47:0];
-            sawtooth_data <= sawtooth_data_next;
-            if (phase_sum[48]) begin
-                if (cycle_count == BURST_CYCLES - 1) begin
-                    cycle_count <= '0;
-                end else begin
-                    cycle_count <= cycle_count + 1'b1;
+            scaler_start <= 1'b0;
+
+            if (calibrated_phase_step !=
+                calibrated_phase_step_d) begin
+                calibrated_phase_step_d <=
+                    calibrated_phase_step;
+                scaled_step_numerator_reg <=
+                    ({16'd0, calibrated_phase_step} *
+                     PULSE_FREQUENCY_HZ_U) +
+                    (CALIBRATION_FREQUENCY_HZ_U / 2);
+                scaler_request <= 1'b1;
+            end else if (scaler_request && !scaler_busy) begin
+                scaler_start <= 1'b1;
+                scaler_request <= 1'b0;
+            end
+
+            if (scaler_valid) begin
+                scaled_pulse_phase_step_reg <=
+                    scaled_step_quotient[47:0];
+                scaled_step_valid <= 1'b1;
+            end
+
+            if (!enable) begin
+                phase_accumulator <= 48'd0;
+                cycle_count <= '0;
+                sawtooth_data <= HIGH_CODE[9:0];
+            end else begin
+                phase_accumulator <= phase_sum[47:0];
+                sawtooth_data <= sawtooth_data_next;
+                if (phase_sum[48]) begin
+                    if (cycle_count == BURST_CYCLES - 1) begin
+                        cycle_count <= '0;
+                    end else begin
+                        cycle_count <= cycle_count + 1'b1;
+                    end
                 end
             end
         end

@@ -6,7 +6,7 @@ module lissajous_core #(
     parameter integer ADC_CAL_PEAK_CODE = 205,
     parameter integer DAC_MID_CODE = 512,
     parameter integer PHASE_PIPELINE_COMP_Q8 = 16'd1_638,
-    parameter integer FREQUENCY_CAL_TARGET_HZ = 10_000,
+    parameter integer FREQUENCY_CAL_TARGET_HZ = 100_000,
     parameter integer FREQUENCY_CAL_BLOCK_SAMPLES =
         SAMPLE_RATE_HZ / 1_000,
     parameter integer FREQUENCY_CAL_AVERAGING_BLOCKS = 256,

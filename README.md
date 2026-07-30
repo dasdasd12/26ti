@@ -28,48 +28,59 @@ DAC1 的图形由同一条 DPLL 相位产生：
 
 ### KEY4 校准与 DAC2
 
-KEY4 启动一条完全独立的 10 kHz 全采样 I/Q 频率校准通路。默认参数使用 1 ms 数据块并平均 256 次相邻块估计，约 257 ms 完成。锁定后冻结 48 位频率字，LED4 点亮。
+KEY4 启动一条完全独立的 100 kHz 全采样 I/Q 频率校准通路。默认参数使用 1 ms 数据块和 257 个相位观测块，通过精确 `atan2(cross,dot)` 与 Kay/最小二乘加权估计频率，约 257 ms 完成。锁定后冻结 48 位频率字，LED4 点亮。
 
 这条冻结结果只供 DAC2 和无线模式使用，绝不控制有线 DAC1：
 
 - 校准完成前，DAC2 输出中值码 512。
-- 校准完成后，DAC2 默认输出 `10 kHz × 489 / 50 = 97.8 kHz` 正弦。
-- KEY5 在 97.8 kHz 和校准后的 10 kHz 之间切换。
+- 校准完成后，DAC2 默认输出 1 kHz 正弦。
+- 每按一次 KEY5，DAC2 按 `1 kHz → 20.4 kHz → 50 kHz → 80.3 kHz → 100 kHz → 1 kHz` 循环。
 - 再按 KEY4 会重新校准；校准期间 DAC1 的连续 DPLL 输出不受影响。
 
-97.8 kHz 的频率字直接由校准结果计算：
+五档频率字都直接由冻结的 100 kHz 校准结果计算：
 
 ```text
-phase_step_97k8 = round(phase_step_10k × 489 / 50)
+phase_step_out = round(phase_step_100k × output_frequency / 100 kHz)
 ```
 
-因此两种 DAC2 频率继承相同的晶振 ppm 校正。
+除法只在校准结果或 KEY5 档位改变时执行一次，DDS 的逐采样路径仍然只有相位累加。所有档位继承相同的晶振 ppm 校正。
 
 ### 无线模式
 
-无线模式下 DAC1、DAC2 输出相同的周期性锯齿脉冲。重复周期为 10 ms：每个周期开始发送一个 10 kHz 单周期上升锯齿，其余时间保持高电平。若 KEY4 已完成校准，锯齿使用冻结的 10 kHz 频率字；否则使用标称 30 MHz 计算值。
+无线模式必须先在有线模式下完成 KEY4 的 100 kHz 校准。未校准时，
+DAC1/DAC2 始终保持中值，KEY2/KEY3/KEY4 不产生 START，UART命令返回
+`NOT_CALIBRATED`。校准完成后按KEY2/KEY3/KEY4，只有DAC1输出由校准
+频率字换算的10 ms周期锯齿脉冲，并通过921600波特率UART
+向上位机发送 START。上位机返回识别频率范围，再发送独立的
+`SCAN_BEGIN` 后锯齿停止；随后每个频率/相位命令只更新DAC1无线DDS。
+DAC2始终继续输出KEY5选择的1 / 20.4 / 50 / 80.3 / 100 kHz固定测试音，
+不跟随SCAN变化。
+收到 DONE 后保持最终正弦并产生声光提示。完整帧格式和状态机见
+`doc/uart_protocol.md`。
 
-无线内容仍是预留实现，尚未接入摄像头闭环。
+无线识别、扫频、调相或DONE期间按KEY6，会取消当前流程并回到刚按下
+KEY1后的无线空闲状态：LED1保持亮，其余无线状态灯熄灭，DAC1回到
+512，DAC2固定测试音继续输出，同时UART向上位机发送`ABORTED (0x83)`事件。
 
 ## 按键和 LED
 
 所有按键和四个 PL LED 都按低有效处理。
 
-| 控件 | 有线模式功能 |
-|---|---|
-| KEY1 | 切换有线/无线模式 |
-| KEY2 | 直线 → 正交 → 二倍频循环 |
-| KEY3 | 1/4 → 1/2 → 3/4 → 满幅循环；复位默认满幅 |
-| KEY4 | 启动或重新启动独立 10 kHz 频率校准 |
-| KEY5 | DAC2 在 97.8 kHz / 10 kHz 之间切换；复位默认 97.8 kHz |
-| KEY6 | 未使用 |
+| 控件 | 有线模式功能 | 无线模式功能 |
+|---|---|---|
+| KEY1 | 切换有线/无线模式 | 切换有线/无线模式 |
+| KEY2 | 直线 → 正交 → 二倍频循环 | 图形 1 START |
+| KEY3 | 1/4 → 1/2 → 3/4 → 满幅循环；复位默认满幅 | 图形 2 START |
+| KEY4 | 启动或重新启动独立 100 kHz 频率校准 | 图形 3 START |
+| KEY5 | DAC2 在 1 / 20.4 / 50 / 80.3 / 100 kHz 间循环；复位默认 1 kHz | 同样只切换DAC2固定测试音 |
+| KEY6 | 未使用 | 取消当前流程并返回无线空闲 |
 
-| LED | 点亮条件 |
-|---|---|
-| LED1 | 无线模式 |
-| LED2 | 不使用，恒灭 |
-| LED3 | 不使用，恒灭 |
-| LED4 | KEY4 的 10 kHz 频率校准完成 |
+| LED | 有线模式 | 无线模式 |
+|---|---|---|
+| LED1 | 灭 | 无线模式 |
+| LED2 | 灭 | 识别/锯齿脉冲 |
+| LED3 | 灭 | 扫频/调相 |
+| LED4 | KEY4 的 100 kHz 频率校准完成 | DONE |
 
 LED 不闪烁。Mizar Z7 的 PL 侧只有四个板载用户按键，因此 `key5_n` 若要实际上板使用，需要另接外部按键或复用其他输入；本工程不提供该引脚约束。
 
@@ -130,10 +141,14 @@ AD2 目前仅保留作后续无线反馈接口，不参与有线 DPLL。
 - `rtl/lissajous_core.sv`：AD1 预处理、连续 DPLL、图形和幅度控制。
 - `rtl/continuous_iq_dpll.sv`：无过零的全采样 I/Q 捕获与连续锁相/锁频环。
 - `rtl/cordic_atan2.sv`：DPLL 复相关向量相角计算。
-- `rtl/reference_frequency_calibrator.sv`：KEY4 独立 10 kHz 全采样 I/Q 频率校准。
-- `rtl/calibrated_sine_test_tone.sv`：DAC2 的校准 10 kHz / 97.8 kHz 正弦。
+- `rtl/reference_frequency_calibrator.sv`：KEY4 独立 100 kHz 全采样 I/Q 频率校准。
+- `rtl/calibrated_sine_test_tone.sv`：DAC2 的五档校准频率正弦。
 - `rtl/dds_sine_lut.sv`：DDS 正弦查找与插值。
 - `rtl/wireless_sawtooth_pulse.sv`：10 ms 周期锯齿脉冲。
+- `rtl/uart_byte_rx.sv`、`rtl/uart_byte_tx.sv`：921600 分数波特率 UART。
+- `rtl/uart_packet_receiver.sv`、`rtl/uart_packet_transmitter.sv`：CRC8 命令帧。
+- `rtl/wireless_uart_controller.sv`：无线流程状态机和命令执行。
+- `rtl/wireless_commanded_dds.sv`：UART 控制的任意频率/相位 DDS。
 - `rtl/manual_control.sv`、`rtl/button_debounce.sv`：按键控制。
 - `rtl/status_leds.sv`：四个低有效 LED。
 
@@ -182,7 +197,7 @@ DPLL 单元专项：
 - 10.10037 kHz 跟踪为 10.100277918 kHz；继续漂移到 10.10087 kHz 后无需返回扫频，跟踪为 10.100812643 kHz。
 - 1 kHz、10 kHz、12 kHz、37.40023 kHz、100 kHz 捕获/重捕获通过。
 - DAC1 图形、幅度、连续输出，以及 KEY4 校准期间隔离通过。
-- DAC2 默认 97.8 kHz、KEY5 切换 10 kHz、再切回 97.8 kHz通过。
+- DAC2 默认 1 kHz，KEY5 循环切换 20.4 / 50 / 80.3 / 100 kHz 并回到 1 kHz 通过。
 - 回归波形中的锁定、跟踪、DAC 数据和各频率字在初始化后均无 X/Z。
 
 ## Vivado 2019.2 时序检查
@@ -210,3 +225,25 @@ DPLL 单元专项：
 `fractional_phase_calibrator.sv`、`phase_step_divider.sv`，
 确认核心文件指向当前 `rtl/lissajous_core.sv`，然后依次 Reset Runs
 中的 `synth_1` 和 `impl_1` 后重新运行。
+
+# 无线 UART 构建
+
+无线控制接口现已使用 100 MHz 系统时钟和 `921600 8-N-1` UART。KEY1
+切换无线模式；无线模式下 KEY2/KEY3/KEY4 分别发起三种图形的识别流程。
+识别脉冲、独立扫频开始、任意频率 DDS、独立/原子相位更新及 DONE
+声光提示的详细命令格式见 [doc/uart_protocol.md](doc/uart_protocol.md)。
+
+本机协议自检：
+
+```powershell
+python tools/wireless_uart_host.py --self-test
+```
+
+921600 波特率的 RTL 专项仿真：
+
+```powershell
+.\run_sim.ps1 -Testbench sim/tb_wireless_uart_protocol.sv `
+  -Top tb_wireless_uart_protocol `
+  -Output icarus/tb_wireless_uart_protocol.vvp `
+  -Waveform sim/tb_wireless_uart_protocol.vcd
+```

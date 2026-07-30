@@ -2,12 +2,13 @@
 
 // Wired calibration verification tone.
 //
-// The 97.8 kHz DDS word is derived directly from the frozen 10 kHz
-// calibration word. Consequently it preserves the measured converter-clock
-// correction instead of reverting to the nominal SAMPLE_RATE_HZ value.
+// The input phase word represents the calibrated 100 kHz reference. KEY5
+// selects a frequency index in 100 Hz units. Scaling is performed only when
+// the calibration word or selection changes; the per-sample DDS path remains
+// a single accumulator addition.
 module calibrated_sine_test_tone #(
-    parameter integer SCALE_NUMERATOR = 489,
-    parameter integer SCALE_DENOMINATOR = 50,
+    parameter integer CALIBRATION_FREQUENCY_HZ = 100_000,
+    parameter integer FREQUENCY_STEP_HZ = 100,
     parameter integer DAC_MID_CODE = 512,
     parameter integer DAC_PEAK_CODE = 205
 ) (
@@ -15,13 +16,23 @@ module calibrated_sine_test_tone #(
     input  logic rst_n,
     input  logic sample_ce,
     input  logic enable,
-    input  logic use_reference_frequency,
+    input  logic [2:0] frequency_sel,
     input  logic [47:0] calibrated_phase_step,
     output logic [47:0] tone_phase_step,
     output logic [9:0] tone_data
 );
 
+    localparam integer CALIBRATION_INDEX =
+        CALIBRATION_FREQUENCY_HZ / FREQUENCY_STEP_HZ;
+    localparam integer DIVISOR_WIDTH =
+        (CALIBRATION_INDEX <= 2) ? 1 :
+        $clog2(CALIBRATION_INDEX + 1);
+    localparam logic [63:0] CALIBRATION_INDEX_U =
+        CALIBRATION_INDEX;
+
     logic [47:0] calibrated_phase_step_d;
+    logic [2:0] frequency_sel_d;
+    logic [15:0] selected_frequency_index;
     logic [63:0] scaled_step_numerator_reg;
     logic [63:0] scaler_quotient;
     logic [47:0] scaled_tone_phase_step_reg;
@@ -36,10 +47,21 @@ module calibrated_sine_test_tone #(
     logic signed [10:0] scaled_sine_sample;
     logic signed [12:0] biased_sample;
     logic [9:0] tone_data_next;
-    localparam logic [63:0] SCALE_NUMERATOR_U =
-        SCALE_NUMERATOR;
-    localparam logic [63:0] SCALE_DENOMINATOR_U =
-        SCALE_DENOMINATOR;
+
+    function automatic logic [15:0] frequency_index_100hz(
+        input logic [2:0] selection
+    );
+        begin
+            case (selection)
+                3'd0: frequency_index_100hz = 16'd10;   // 1.0 kHz
+                3'd1: frequency_index_100hz = 16'd204;  // 20.4 kHz
+                3'd2: frequency_index_100hz = 16'd500;  // 50.0 kHz
+                3'd3: frequency_index_100hz = 16'd803;  // 80.3 kHz
+                default:
+                    frequency_index_100hz = 16'd1000;   // 100.0 kHz
+            endcase
+        end
+    endfunction
 
     function automatic logic signed [10:0] scale_to_peak(
         input logic signed [10:0] value
@@ -61,9 +83,14 @@ module calibrated_sine_test_tone #(
     endfunction
 
     initial begin
-        if ((SCALE_NUMERATOR <= 0) ||
-            (SCALE_DENOMINATOR <= 0)) begin
-            $error("Calibrated test-tone scale must be positive");
+        if ((CALIBRATION_FREQUENCY_HZ <= 0) ||
+            (FREQUENCY_STEP_HZ <= 0) ||
+            ((CALIBRATION_FREQUENCY_HZ %
+              FREQUENCY_STEP_HZ) != 0)) begin
+            $error("Calibration frequency must contain whole frequency steps");
+        end
+        if (CALIBRATION_INDEX != 1000) begin
+            $error("DAC2 selector requires a 100 kHz/100 Hz calibration index");
         end
         if ((DAC_MID_CODE < 0) || (DAC_MID_CODE > 1023) ||
             (DAC_PEAK_CODE <= 0) ||
@@ -82,26 +109,25 @@ module calibrated_sine_test_tone #(
 
     unsigned_fraction_divider #(
         .NUMERATOR_WIDTH(64),
-        .DENOMINATOR_WIDTH(6)
+        .DENOMINATOR_WIDTH(DIVISOR_WIDTH)
     ) u_scale_divider (
         .clk(clk),
         .rst_n(rst_n),
         .start(scaler_start),
         .numerator(scaled_step_numerator_reg),
-        .denominator(SCALE_DENOMINATOR_U[5:0]),
+        .denominator(
+            CALIBRATION_INDEX_U[DIVISOR_WIDTH-1:0]),
         .busy(scaler_busy),
         .valid(scaler_valid),
         .quotient(scaler_quotient)
     );
 
     always @* begin
-        if (use_reference_frequency) begin
-            tone_phase_step = calibrated_phase_step;
-        end else if (scaled_step_valid) begin
-            tone_phase_step = scaled_tone_phase_step_reg;
-        end else begin
-            tone_phase_step = 48'd0;
-        end
+        selected_frequency_index =
+            frequency_index_100hz(frequency_sel);
+        tone_phase_step =
+            scaled_step_valid ?
+            scaled_tone_phase_step_reg : 48'd0;
 
         scaled_sine_sample = scale_to_peak(sine_sample);
         biased_sample = scaled_sine_sample + DAC_MID_CODE;
@@ -119,6 +145,7 @@ module calibrated_sine_test_tone #(
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             calibrated_phase_step_d <= 48'd0;
+            frequency_sel_d <= 3'd0;
             scaled_step_numerator_reg <= 64'd0;
             scaled_tone_phase_step_reg <= 48'd0;
             scaler_request <= 1'b0;
@@ -129,19 +156,20 @@ module calibrated_sine_test_tone #(
         end else begin
             scaler_start <= 1'b0;
 
-            // 489/50 = 9.78. Calculate it once when the frozen calibration
-            // word changes; the per-sample DDS path then contains only an
-            // accumulator add.
-            if (calibrated_phase_step !=
-                calibrated_phase_step_d) begin
+            if ((calibrated_phase_step !=
+                 calibrated_phase_step_d) ||
+                (frequency_sel != frequency_sel_d)) begin
                 calibrated_phase_step_d <=
                     calibrated_phase_step;
+                frequency_sel_d <= frequency_sel;
                 scaled_step_numerator_reg <=
                     ({16'd0, calibrated_phase_step} *
-                     SCALE_NUMERATOR_U) +
-                    (SCALE_DENOMINATOR_U / 2);
+                     selected_frequency_index) +
+                    (CALIBRATION_INDEX_U / 2);
                 scaler_request <= 1'b1;
-                scaled_step_valid <= 1'b0;
+                if (!scaled_step_valid) begin
+                    scaled_tone_phase_step_reg <= 48'd0;
+                end
             end else if (scaler_request && !scaler_busy) begin
                 scaler_start <= 1'b1;
                 scaler_request <= 1'b0;
