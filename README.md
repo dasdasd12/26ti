@@ -1,157 +1,212 @@
-# 李萨如图形显示控制装置 FPGA 初版
+# 李萨如图形控制装置 FPGA 初版
 
-本目录完成题目第 1-4 问的 RTL 初步搭建，目标板为 Mizar Z7。当前版本完成有线输入模式，并预留无线模式状态；无线摄像头闭环和信号源/FPGA 长期频偏补偿尚未实现。PLL 位置已预留，生成对应 Vivado IP 后可进行完整综合。
+本工程面向 Vivado 2019.2，完成题目第 1～4 问所需的 FPGA RTL 初步搭建。当前版本使用 10 位并行 AD/DA、100 MHz 系统时钟和 30 MHz AD/DA 时钟，不包含引脚约束。
 
-## 已实现功能
+## 当前信号通路
 
-- 两路 10 位并行 AD 输入采用 offset-binary 编码，各自具有独立的 CLK 和低有效 OE 顶层端口。
-- 两路 10 位并行 DA 输出采用 offset-binary 编码，各自具有独立的 CLK 顶层端口；`da2_data` 始终复制最终 `da_data`，两路幅值相同。
-- 50 MHz PL 输入经过 PLL 预留模块产生 100 MHz 系统时钟，再产生同相的 12.5 MHz AD/DA 时钟。
-- PLL 锁定后自动执行 32 个 100 MHz 时钟周期的内部软复位。
-- DA2 外部回接 AD2 后，直通模式自动检测并校准实际模拟输出的固定相位延迟。
-- KEY1 切换有线/无线模式。
-- 有线模式下，KEY2 循环选择直通、正交和二倍频图形，KEY3 循环选择 2、4、6、8 div。
-- 相位自动校准锁定后，KEY5/KEY6 分别增加/减小固定相位角，每次微调约 0.1°，支持长按连续调整。
-- 无线模式下 KEY2、KEY3、KEY5、KEY6 暂不响应。
-- KEY4 闲置，不改变工作状态，也不控制 LED。
-- 无线算法接入前，无线模式下 DA 输出固定为安全中点码 512。
+### 有线模式：DAC1 连续 DPLL
 
-## 信号处理方法
+AD1 的每一个采样点都会送入 `continuous_iq_dpll.sv`，有效路径已经完全取消过零检测，也不使用 AD2 回环或 KEY4 的无线校准结果。
 
-题目校准状态为 8 div × 0.5 V/div = 4 Vpp。初版假设模拟输入、输出调理电路将 4 Vpp 映射为 AD/DA 的 512 codes p-p，即数字峰值 `CAL_PEAK_CODE=256`。
+DPLL 分为三步：
 
-AD 数据只用于带迟滞的正向过零检测和输入周期测量。测得周期后，硬件计算
-`phase_step = 2^32 / measured_period`，由 32 位相位累加器和正弦查找表重构稳定输出；
-每次检测到输入正向过零时重新对齐 DDS 相位。本阶段按要求不处理信号源与 FPGA
-之间的长期频率偏差。
+1. 在 1～110 kHz 范围内，以 1 kHz 间隔执行 1 ms I/Q 相关粗扫。
+2. 在最佳粗扫点附近，以 100 Hz 间隔和 262144 点窗口执行 I/Q 相关细扫。
+3. 进入连续跟踪，用 CORDIC 求复相关向量相角；20 kHz 及以上使用 65536 点窗口，低频使用 262144 点窗口。相邻块相角差修正 48 位 DDS 频率字，绝对相角修正输出相位。
 
-1. 直通图形：DDS 输出与测得输入同频，并在输入正向过零点同步相位；不是复制 AD 样本。
-2. 正交图形：在同频 DDS 相位上增加 90°。
-3. 二倍频图形：使用两倍 DDS 相位产生二倍频，不再使用输入平方运算。
-4. 幅度：对数字峰值乘以 1/4、1/2、3/4 或 1，对应 2、4、6、8 div。
+跟踪窗口都是 2 的幂，频率校正只需要算术移位，不在实时 DPLL 路径中使用除法。参考正弦和对应 ADC 样点同时寄存一级，使插值 LUT 与后续 I/Q、幅值比较和频率字更新之间形成明确的流水线边界。
 
-DDS 满幅峰值固定为 `CAL_PEAK_CODE=256`，因此输出幅度不随输入波形瞬时幅度抖动。
-`PHASE_PIPELINE_COMP_SAMPLES` 是初始固定补偿。直通模式下，逻辑继续比较 AD1 与
-AD2 回环信号的正向过零位置：反馈落后时按本次测得的整采样点误差增加 DDS
-相位提前量，反馈超前时反向修正；连续三次相位误差不超过 ±1 个采样点后置位内部
-`phase_cal_locked`。得到的补偿按采样点保存，并自动随测得频率换算为 DDS 相位；
-正交和二倍频模式沿用这份补偿，不在这些模式中更新校准环。
+进入跟踪状态后，DAC1 会持续输出。短时频率漂移可能使调试用 `locked` 标志暂时清零，但不会中断 DAC1；只有连续相关能量不足、DPLL 返回重新扫频时，DAC1 才回到中值码。
 
-自动校准锁定后会冻结整采样点粗调，避免反馈环抵消人工操作。人工微调量
-`manual_phase_trim_word` 直接保存为 32 位 DDS 固定相位角：KEY5 每次增加约
-0.1°，KEY6 每次减少约 0.1°，不再随输入频率缩放。按住 KEY5 或 KEY6 约
-0.5 秒后以约 200 次/秒连续调整，单击仍保持 0.1° 精度。
+DAC1 的图形由同一条 DPLL 相位产生：
 
-锁定时记录对应输入周期。后续检测到周期变化超过约 0.39%（且至少 2 个采样点）
-时，自动撤销旧的相位锁并重新测量模拟回环延迟。重新锁定期间暂不叠加人工相位，
-防止自动环将它抵消；粗调锁定后再恢复原来的固定人工相位。因此在一个频率上调好
-的固定相位不会仅因切换频率而按采样周期成比例变化。
+- 直线：与 AD1 同频、同相的 DDS 正弦。
+- 正交：在锁定相位上增加 90°。
+- 二倍频：使用两倍锁定相位。
 
-## 文件
+这不是复制 ADC 样本。输出幅度由 DDS 固定生成，不跟随输入瞬时幅度抖动。
 
-- `rtl/lissajous_top.sv`：工程顶层。
-- `rtl/lissajous_core.sv`：输入测频、DDS 相位同步、图形与幅度处理。
-- `rtl/phase_step_divider.sv`：计算 32 位 DDS 相位步进字的时序除法器。
-- `rtl/dds_sine_lut.sv`：256 相位点、四分之一波对称的正弦查找表。
-- `rtl/ad_da_clock_gen.sv`：12.5 MHz 转换器时钟和内部采样使能。
-- `rtl/soft_power_on_reset.sv`：无需外部管脚的上电软复位。
+### KEY4 校准与 DAC2
+
+KEY4 启动一条完全独立的 10 kHz 全采样 I/Q 频率校准通路。默认参数使用 1 ms 数据块并平均 256 次相邻块估计，约 257 ms 完成。锁定后冻结 48 位频率字，LED4 点亮。
+
+这条冻结结果只供 DAC2 和无线模式使用，绝不控制有线 DAC1：
+
+- 校准完成前，DAC2 输出中值码 512。
+- 校准完成后，DAC2 默认输出 `10 kHz × 489 / 50 = 97.8 kHz` 正弦。
+- KEY5 在 97.8 kHz 和校准后的 10 kHz 之间切换。
+- 再按 KEY4 会重新校准；校准期间 DAC1 的连续 DPLL 输出不受影响。
+
+97.8 kHz 的频率字直接由校准结果计算：
+
+```text
+phase_step_97k8 = round(phase_step_10k × 489 / 50)
+```
+
+因此两种 DAC2 频率继承相同的晶振 ppm 校正。
+
+### 无线模式
+
+无线模式下 DAC1、DAC2 输出相同的周期性锯齿脉冲。重复周期为 10 ms：每个周期开始发送一个 10 kHz 单周期上升锯齿，其余时间保持高电平。若 KEY4 已完成校准，锯齿使用冻结的 10 kHz 频率字；否则使用标称 30 MHz 计算值。
+
+无线内容仍是预留实现，尚未接入摄像头闭环。
+
+## 按键和 LED
+
+所有按键和四个 PL LED 都按低有效处理。
+
+| 控件 | 有线模式功能 |
+|---|---|
+| KEY1 | 切换有线/无线模式 |
+| KEY2 | 直线 → 正交 → 二倍频循环 |
+| KEY3 | 1/4 → 1/2 → 3/4 → 满幅循环；复位默认满幅 |
+| KEY4 | 启动或重新启动独立 10 kHz 频率校准 |
+| KEY5 | DAC2 在 97.8 kHz / 10 kHz 之间切换；复位默认 97.8 kHz |
+| KEY6 | 未使用 |
+
+| LED | 点亮条件 |
+|---|---|
+| LED1 | 无线模式 |
+| LED2 | 不使用，恒灭 |
+| LED3 | 不使用，恒灭 |
+| LED4 | KEY4 的 10 kHz 频率校准完成 |
+
+LED 不闪烁。Mizar Z7 的 PL 侧只有四个板载用户按键，因此 `key5_n` 若要实际上板使用，需要另接外部按键或复用其他输入；本工程不提供该引脚约束。
+
+## 幅度和编码
+
+AD/DA 均使用 10 位 offset-binary：
+
+- 满量程：±5 V，对应 0～1023。
+- 当前目标幅度：±2 V，即 4 Vpp。
+- 中值码：512。
+- 数字峰值：`round(512 × 2 / 5) = 205`。
+- 未反相的目标范围：307～717。
+
+板外模拟输出级会反相，因此顶层在送往 DAC 前执行 `1024-code` 数字反相。数字总线范围仍为 307～717，经过模拟反相后才得到预期方向。无线锯齿在 FPGA 端表现为 717 向 307 下降，经过模拟反相后为 −2 V 向 +2 V 上升。
+
+## 时钟、复位和接口
+
+顶层 `lissajous_top.sv` 直接预留 `clk_wiz_0`：
+
+```text
+clk_in1  = 50 MHz
+clk_out1 = 100 MHz  系统/按键域
+clk_out2 = 30 MHz   AD、DA、DPLL、DDS 域
+```
+
+请在 Vivado 2019.2 中生成同名 Clocking Wizard IP，端口为 `clk_in1`、`clk_out1`、`clk_out2` 和 `locked`。仿真使用 `sim/clk_wiz_0_sim.sv`，不要把该仿真模型加入综合源。
+
+工程没有外部复位端口。PLL 锁定后，`soft_power_on_reset.sv` 自动产生内部软复位；30 MHz 域再同步释放复位。
+
+AD1、AD2、DA1、DA2 各自有独立的时钟输出端口。四路时钟目前同为 30 MHz、同相，并分别由独立 Xilinx `ODDR` 原语转发到顶层端口，ODDR 输出不回读到 fabric。AD1/AD2 的 OE 均固定为低有效。
+
+主要端口：
+
+- AD1：`ad_data[9:0]`、`ad_clk`、`ad_oe_n`
+- AD2：`ad2_data[9:0]`、`ad2_clk`、`ad2_oe_n`
+- DA1：`da_data[9:0]`、`da_clk`
+- DA2：`da2_data[9:0]`、`da2_clk`
+
+AD2 目前仅保留作后续无线反馈接口，不参与有线 DPLL。
+
+工程不含 `PACKAGE_PIN`、`IOSTANDARD` 或外部输入输出延时约束，需要根据最终 AD/DA 型号和实际接线补充。
+
+## ILA
+
+当前 ILA 连接为：
+
+- `probe0`：AD1 原始 10 位数据。
+- `probe1`：DAC1 顶层 10 位数据。
+- `probe2`：有线 DPLL 的严格锁定标志。
+- `probe3`：32 位 DPLL 相位误差字的高 16 位。
+- `probe4`：`probe3[15:8]`。
+
+`probe3` 保留了旧信号名 `phase_error_q8`，但当前不再表示“采样点误差”。其 1 LSB 等于一周的 `1/65536`，约为 0.005493°。
+
+## 主要 RTL 文件
+
+- `rtl/lissajous_top.sv`：顶层时钟、跨时钟、按键、ILA 和双 DAC 路由。
+- `rtl/lissajous_core.sv`：AD1 预处理、连续 DPLL、图形和幅度控制。
+- `rtl/continuous_iq_dpll.sv`：无过零的全采样 I/Q 捕获与连续锁相/锁频环。
+- `rtl/cordic_atan2.sv`：DPLL 复相关向量相角计算。
+- `rtl/reference_frequency_calibrator.sv`：KEY4 独立 10 kHz 全采样 I/Q 频率校准。
+- `rtl/calibrated_sine_test_tone.sv`：DAC2 的校准 10 kHz / 97.8 kHz 正弦。
+- `rtl/dds_sine_lut.sv`：DDS 正弦查找与插值。
+- `rtl/wireless_sawtooth_pulse.sv`：10 ms 周期锯齿脉冲。
 - `rtl/manual_control.sv`、`rtl/button_debounce.sv`：按键控制。
-- `sim/tb_lissajous_top.sv`：1-4 问自检仿真。
-- `sim/clk_wiz_0_sim.sv`：仅供 RTL 仿真的 PLL 行为模型，不加入综合源。
-- `sim/ila_0_sim.sv`：仅供 RTL 仿真的 ILA 空模型，不加入综合源。
-- `scripts/vivado_synth_check.tcl`：Vivado 2019.2 综合及时序检查。
-- `run_sim.ps1`：Icarus Verilog 编译、运行与 VCD 生成脚本。
+- `rtl/status_leds.sv`：四个低有效 LED。
 
-## 按键与指示灯
-
-- KEY1：有线/无线模式切换，复位默认为有线。
-- KEY2：仅在有线模式有效，图形循环为直通 → 正交 → 二倍频 → 直通。
-- KEY3：仅在有线模式有效，幅度循环为 8 → 2 → 4 → 6 → 8 div。
-- KEY4：闲置，按下不改变模式、图形、幅度或 LED。
-- KEY5：仅在有线模式且相位校准锁定后有效，每按一次增加约 0.1°；长按连续增加。
-- KEY6：仅在有线模式且相位校准锁定后有效，每按一次减少约 0.1°；长按连续减少。
-
-复位默认状态为有线模式、直通图形、满幅 8 div。
-
-根据《Mizar Z7 用户手册》3.7.5 和 3.7.6 节，PL 侧只有四个用户按键
-（K4～K7，对应 PL_KEY1～PL_KEY4）和四个用户 LED（D6～D9）。按键输入和
-LED 输出均为低有效，顶层 LED 端口为 `led_n[3:0]`：
-
-| LED | 低电平点亮条件 |
-|---:|---|
-| 1 | 无线模式 |
-| 2 | 未使用，始终熄灭 |
-| 3 | 未使用，始终熄灭 |
-| 4 | 未使用，始终熄灭 |
-
-LED1 是唯一使用的状态灯：无线模式点亮，有线模式熄灭。所有 LED 均不闪烁；
-输入周期锁定和相位校准锁定保留为内部调试状态，不占用物理 LED。
-
-## 端口与约束
-
-顶层按键端口为 `key1_n` 至 `key6_n`，没有外部复位端口。其中板载 PL 用户按键
-仍只有 `key1_n` 至 `key4_n`；新增的 `key5_n`、`key6_n` 需要使用外部扩展按键或
-其他输入资源，且同样按低有效设计。本工程不提供它们的引脚约束。转换器数据端口为
-`ad_data[9:0]`、`ad2_data[9:0]`、`da_data[9:0]` 和 `da2_data[9:0]`。控制端口为：
-
-- AD1：`ad_clk`、`ad_oe_n`
-- AD2：`ad2_clk`、`ad2_oe_n`
-- DA1：`da_clk`
-- DA2：`da2_clk`
-
-四个 CLK 是相互独立的顶层输出引脚，当前逻辑将它们设置为同频同相的 12.5 MHz；
-两个 AD OE 均固定为低有效。内部 `rst_n` 等待 PLL 锁定后保持低电平
-32 个 100 MHz 周期（约 320 ns），随后同步释放，因此不需要为复位分配 LOC。
-工程不提供任何引脚约束，不包含 `PACKAGE_PIN` 或 `IOSTANDARD`；实际管脚、电平和
-AD/DA 外部输入输出延时应在器件型号及接线确定后另行添加。
-
-顶层直接实例化名为 `clk_wiz_0` 的 Clocking Wizard，端口为 `clk_in1`、
-`clk_out1` 和 `locked`。后续在 Vivado 2019.2 中生成同名的 50 MHz 输入、
-100 MHz 输出 IP 即可。综合 RTL 中没有 `` `ifdef SYNTHESIS `` 或行为延时；
-`run_sim.ps1` 只在 RTL 仿真时额外加入 `sim/clk_wiz_0_sim.sv`。
+旧的 `fractional_phase_calibrator.sv`、`phase_step_divider.sv` 和 `ad_da_clock_gen.sv` 已删除；有效设计中不存在过零检测通路，也不存在旧的 ODDR 输出回读结构。
 
 ## 仿真
 
-在 PowerShell 中运行：
+使用 Icarus Verilog/SystemVerilog：
 
 ```powershell
 .\run_sim.ps1
 ```
 
-仿真使用 1 kHz 和 100 kHz、256 codes 峰值的正弦 AD1 模型，并使用三级采样延迟
-模拟 DA2→AD2 外部回环。仿真检查 PLL 的 100 MHz 输出、12.5 MHz 转换器时钟、
-测频与 DDS 锁定、回环相位校准、换频重新锁定、固定角度微调和长按连调、四路独立
-CLK、两路 AD OE、双 DAC 数据一致性、有线按键控制、无线按键屏蔽和 LED1 状态、
-四档峰峰值、正交相关性及二倍频过零数，并生成 `sim/tb_lissajous_top.vcd`。
+默认测试覆盖 1 kHz / 100 kHz DPLL 捕获和重捕获、三种图形、四档幅度及 KEY5 对 DAC1 的隔离。
 
-生成 `clk_wiz_0` IP 并将其加入工程后，Vivado 2019.2 综合检查可运行：
+DAC2 和 KEY4 专项：
 
 ```powershell
-vivado -mode batch -nolog -nojournal -source .\scripts\vivado_synth_check.tcl
+.\run_sim.ps1 -Testbench sim/tb_wired_calibration_output.sv `
+  -Top tb_wired_calibration_output `
+  -Output icarus/tb_wired_calibration_output.vvp `
+  -Waveform sim/tb_wired_calibration_output.vcd
 ```
 
-脚本默认器件为 `xc7z020clg400-2`。Mizar Z7010 可先设置
-`$env:FPGA_PART="xc7z010clg400-1"` 后运行同一命令。
+DPLL 单元专项：
 
-综合脚本会拒绝非 2019.2 版本。脚本只约束外部 50 MHz PLL 输入时钟，不包含引脚
-约束。PLL 生成时钟约束由 Clocking Wizard IP 提供；AD/DA 外部输入输出延时尚未
-约束，因为它取决于最终转换器型号。
+```powershell
+.\run_sim.ps1 -Testbench sim/tb_continuous_iq_dpll.sv `
+  -Top tb_continuous_iq_dpll `
+  -Output icarus/tb_continuous_iq_dpll.vvp `
+  -Waveform sim/tb_continuous_iq_dpll.vcd
+```
 
-当前验证结果：
+97.8～100 kHz 高频专项：
 
-- Icarus Verilog：PLL 仿真输出为 100 MHz，AD/DA 时钟为 12.5 MHz。
-- 三级采样回环模型下，相位环在 496 个采样内锁定到 3 个采样点补偿，残差为 0 个采样点，AD1/AD2 同相相关量为 1.0024。
-- KEY5/KEY6 的锁前屏蔽、锁后 ±0.1° 调整、长按连调、固定角度跨频保持及无线模式屏蔽均通过。
-- 从 100 kHz 切换至 1 kHz 后旧锁会失效；返回直通模式可重新锁定模拟延迟并恢复原人工相位角。
-- 1 kHz/100 kHz 测频与 DDS 锁定、四路独立 CLK、两路 AD OE、双 DAC 等幅复制、四档幅度、三个图形、有线按键控制、无线按键屏蔽、LED1 状态和无线安全输出全部通过。
-- 100 kHz 校准后正交反馈与输入的归一化相关量为 0.0123，二倍频测试窗口内检测到 10 次过零；1 kHz 测得周期为 12500 个采样点。
-- 当前未运行 Vivado 综合；生成 PLL IP 后再检查 100 MHz 时序、资源占用和外部接口时序。
+```powershell
+.\run_sim.ps1 -Testbench sim/tb_high_frequency_dpll.sv `
+  -Top tb_high_frequency_dpll `
+  -Output icarus/tb_high_frequency_dpll.vvp `
+  -Waveform sim/tb_high_frequency_dpll.vcd
+```
 
-## 上板前需要确认
+当前回归结果：
 
-1. AD、DA 的具体型号、数据建立保持时间、时钟有效沿、OE 极性和数字电平。
-2. 模拟前端的偏置和增益，使 4 Vpp 输入、输出均对应 512 codes p-p。
-3. 将 DA2 模拟输出接至 AD2 模拟输入，并确认两个通道的偏置、极性和增益一致；不要直接连接不兼容的电压范围。
-4. 生成并接入 `clk_wiz_0`，确认 `locked` 信号和 100 MHz 输出约束。
-5. 在目标器件上确认回环校准、时序除法器、正弦 LUT 和 100 MHz 数据路径的资源占用及时序裕量。
-6. 实测输入噪声条件下的过零稳定性；必要时再调整 `ZERO_HYST_CODE` 或增加周期测量滤波。
+- 97.80037 kHz、99.00023 kHz、100.00525 kHz 分别跟踪为 97.800370479 kHz、99.000231204 kHz、100.005247407 kHz。
+- 10.10037 kHz 跟踪为 10.100277918 kHz；继续漂移到 10.10087 kHz 后无需返回扫频，跟踪为 10.100812643 kHz。
+- 1 kHz、10 kHz、12 kHz、37.40023 kHz、100 kHz 捕获/重捕获通过。
+- DAC1 图形、幅度、连续输出，以及 KEY4 校准期间隔离通过。
+- DAC2 默认 97.8 kHz、KEY5 切换 10 kHz、再切回 97.8 kHz通过。
+- 回归波形中的锁定、跟踪、DAC 数据和各频率字在初始化后均无 X/Z。
+
+## Vivado 2019.2 时序检查
+
+可运行：
+
+```powershell
+& 'C:\program1\Xilinx\Vivado\2019.2\bin\vivado.bat' `
+  -mode batch -source scripts/vivado_synth_check.tcl `
+  -nojournal -nolog
+```
+
+当前 `xc7z020clg400-2` 综合后内部时序检查结果为：
+
+- 总体 WNS：+6.856 ns，TNS：0。
+- 30 MHz AD/DA 域 WNS：+12.291 ns。
+- 100 MHz 系统域 WNS：+6.856 ns。
+- 资源估计：4352 LUT、2764 寄存器、51 DSP。
+
+这是无布局布线的综合时序检查。工程按要求没有引脚、`IOSTANDARD` 和外部 I/O delay 约束，因此生成 bitstream 前仍需补齐这些约束，并以实现后的 timing summary 为最终依据。
+
+若 Vivado GUI 仍显示从
+`u_fractional_phase_calibrator/phase_calibration_q8_reg` 出发的路径，
+说明工程还在使用旧 source set 或旧综合检查点。请从工程中移除已删除的
+`fractional_phase_calibrator.sv`、`phase_step_divider.sv`，
+确认核心文件指向当前 `rtl/lissajous_core.sv`，然后依次 Reset Runs
+中的 `synth_1` 和 `impl_1` 后重新运行。

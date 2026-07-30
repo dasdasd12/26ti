@@ -1,118 +1,119 @@
 `timescale 1ns/1ps
 
 module lissajous_core #(
-    parameter integer SAMPLE_RATE_HZ = 12_500_000,
+    parameter integer SAMPLE_RATE_HZ = 30_000_000,
     parameter integer ADC_MID_CODE = 512,
+    parameter integer ADC_CAL_PEAK_CODE = 205,
     parameter integer DAC_MID_CODE = 512,
-    parameter integer CAL_PEAK_CODE = 256,
-    parameter integer ZERO_HYST_CODE = 4,
-    parameter integer PHASE_PIPELINE_COMP_SAMPLES = 2,
-    parameter integer PHASE_LOCK_CONFIRM_CYCLES = 3,
-    parameter integer MAX_PHASE_CAL_SAMPLES = 96,
-    // 2^32 / 3600: one manual key step is approximately 0.1 degree.
-    parameter [31:0] MANUAL_PHASE_STEP_WORD = 32'd1_193_046
+    parameter integer PHASE_PIPELINE_COMP_Q8 = 16'd1_638,
+    parameter integer FREQUENCY_CAL_TARGET_HZ = 10_000,
+    parameter integer FREQUENCY_CAL_BLOCK_SAMPLES =
+        SAMPLE_RATE_HZ / 1_000,
+    parameter integer FREQUENCY_CAL_AVERAGING_BLOCKS = 256,
+    parameter integer DPLL_MIN_FREQUENCY_HZ = 1_000,
+    parameter integer DPLL_MAX_FREQUENCY_HZ = 110_000,
+    parameter integer DPLL_COARSE_STEP_HZ = 1_000,
+    parameter integer DPLL_COARSE_WINDOW_SAMPLES =
+        SAMPLE_RATE_HZ / 1_000,
+    parameter integer DPLL_FINE_RADIUS_STEPS = 10,
+    parameter integer DPLL_FINE_WINDOW_SAMPLES = 262_144,
+    parameter integer DPLL_TRACK_WINDOW_SAMPLES = 65_536,
+    parameter integer DPLL_LOW_TRACK_WINDOW_SAMPLES = 262_144,
+    parameter integer DPLL_LOW_TRACK_THRESHOLD_HZ = 20_000
 ) (
     input  logic clk,
     input  logic rst_n,
     input  logic sample_ce,
     input  logic [9:0] ad_data,
-    input  logic [9:0] ad_feedback_data,
-    input  logic phase_cal_enable,
-    input  logic fine_phase_inc_pulse,
-    input  logic fine_phase_dec_pulse,
+    input  logic wired_dpll_enable,
+    input  logic frequency_cal_start_pulse,
     input  logic [1:0] mode_sel,
     input  logic [1:0] amplitude_sel,
     output logic [9:0] da_data,
     output logic period_locked,
-    output logic [15:0] measured_period,
+    output logic [16:0] measured_period,
     output logic phase_cal_locked,
-    output logic signed [16:0] phase_error_samples
+    output logic frequency_cal_active,
+    output logic frequency_cal_locked,
+    output logic [47:0] frequency_cal_phase_step,
+    output logic [47:0] wired_dpll_phase_step,
+    output logic signed [15:0] phase_error_q8
 );
 
     localparam logic [1:0] MODE_DIRECT = 2'd0;
     localparam logic [1:0] MODE_QUADRATURE = 2'd1;
     localparam logic [1:0] MODE_DOUBLE = 2'd2;
-    localparam integer MIN_VALID_PERIOD = SAMPLE_RATE_HZ / 125_000;
-    localparam integer MAX_VALID_PERIOD = SAMPLE_RATE_HZ / 500;
     localparam logic [31:0] PHASE_QUARTER = 32'h4000_0000;
-    localparam logic signed [32:0] MANUAL_PHASE_STEP =
-        $signed({1'b0, MANUAL_PHASE_STEP_WORD});
-    localparam logic signed [32:0] MAX_MANUAL_PHASE =
-        33'sd2_147_483_647;
-    localparam logic signed [32:0] MIN_MANUAL_PHASE =
-        -33'sd2_147_483_648;
 
-    logic signed [10:0] current_sample;
-    logic signed [10:0] dds_sample;
-    logic signed [10:0] selected_sample;
-    logic signed [10:0] scaled_sample;
     logic signed [12:0] centered_wide;
-    logic signed [10:0] feedback_sample;
-    logic signed [12:0] feedback_centered_wide;
-
-    logic crossing_armed;
-    logic crossing_seen;
-    logic rising_crossing;
-    logic [15:0] period_counter;
-    logic [16:0] period_candidate;
-    logic feedback_crossing_armed;
-    logic feedback_rising_crossing;
-    logic [15:0] feedback_age_counter;
-    logic [16:0] feedback_delay_candidate;
-    logic signed [16:0] feedback_error_candidate;
-    logic [2:0] phase_stable_count;
-    logic signed [7:0] phase_calibration_samples;
-    logic signed [16:0] phase_calibration_sum;
-    logic [7:0] phase_calibration_magnitude;
-    logic [31:0] phase_calibration_adjust;
-    (* mark_debug = "true", keep = "true" *)
-    logic signed [32:0] manual_phase_trim_word;
-    logic [31:0] manual_phase_adjust;
-    logic [15:0] phase_calibration_period;
-    logic [16:0] calibration_period_difference;
-    logic [15:0] frequency_change_threshold;
-    logic frequency_change_detected;
-
-    logic phase_step_start;
-    logic [15:0] phase_divisor;
-    logic phase_divider_busy;
-    logic phase_step_valid;
-    logic [31:0] phase_step_quotient;
-    logic [31:0] pending_phase_step;
-    logic [31:0] active_phase_step;
-    logic phase_step_ready;
-    logic [31:0] phase_accumulator;
-    logic [31:0] base_phase;
+    logic signed [10:0] current_sample;
+    logic dpll_tracking_active;
+    logic dpll_locked;
+    logic [31:0] dpll_tracked_phase;
+    logic signed [31:0] dpll_phase_error_word;
+    logic [63:0] pipeline_phase_product;
+    logic [31:0] pipeline_phase_compensation_reg;
+    logic [31:0] pipeline_phase_compensation;
     logic [31:0] compensated_phase;
-    logic [31:0] dds_phase;
+    logic [31:0] selected_phase_next;
+    logic [31:0] selected_phase_reg;
+    logic signed [10:0] dds_sample;
+    logic signed [10:0] dds_sample_reg;
+    logic [1:0] amplitude_sel_phase_reg;
+    logic [1:0] amplitude_sel_dds_reg;
+    logic phase_valid_reg;
+    logic dds_valid_reg;
+    logic signed [10:0] amplitude_scaled_sample;
+    logic [31:0] frequency_cal_measured_samples;
 
     function automatic logic signed [10:0] clamp_to_cal(
         input logic signed [12:0] value
     );
         begin
-            if (value > CAL_PEAK_CODE) begin
-                clamp_to_cal = CAL_PEAK_CODE;
-            end else if (value < -CAL_PEAK_CODE) begin
-                clamp_to_cal = -CAL_PEAK_CODE;
+            if (value > ADC_CAL_PEAK_CODE) begin
+                clamp_to_cal = ADC_CAL_PEAK_CODE;
+            end else if (value < -ADC_CAL_PEAK_CODE) begin
+                clamp_to_cal = -ADC_CAL_PEAK_CODE;
             end else begin
                 clamp_to_cal = value[10:0];
             end
         end
     endfunction
 
-    function automatic logic signed [10:0] apply_amplitude(
+    function automatic logic signed [10:0] scale_for_amplitude(
         input logic signed [10:0] value,
         input logic [1:0] selection
     );
-        logic signed [12:0] value_wide;
+        logic [9:0] selected_peak;
+        logic signed [21:0] peak_product;
+        logic signed [21:0] rounded_magnitude;
         begin
-            value_wide = value;
             case (selection)
-                2'd0: apply_amplitude = value_wide >>> 2;
-                2'd1: apply_amplitude = value_wide >>> 1;
-                2'd2: apply_amplitude = (value_wide * 3) >>> 2;
-                default: apply_amplitude = value;
+                2'd0:
+                    selected_peak = (ADC_CAL_PEAK_CODE + 2) / 4;
+                2'd1:
+                    selected_peak = (ADC_CAL_PEAK_CODE + 1) / 2;
+                2'd2:
+                    selected_peak =
+                        ((ADC_CAL_PEAK_CODE * 3) + 2) / 4;
+                default:
+                    selected_peak = ADC_CAL_PEAK_CODE;
             endcase
+
+            // One coefficient-selected multiply replaces the former
+            // full-scale multiply followed by a second amplitude multiply.
+            peak_product = value * $signed({1'b0, selected_peak});
+            if (peak_product < 0) begin
+                rounded_magnitude =
+                    ((-peak_product) + 22'sd128) >>> 8;
+                scale_for_amplitude =
+                    -rounded_magnitude[10:0];
+            end else begin
+                rounded_magnitude =
+                    (peak_product + 22'sd128) >>> 8;
+                scale_for_amplitude =
+                    rounded_magnitude[10:0];
+            end
         end
     endfunction
 
@@ -132,291 +133,124 @@ module lissajous_core #(
         end
     endfunction
 
-    phase_step_divider u_phase_step_divider (
+    continuous_iq_dpll #(
+        .SAMPLE_RATE_HZ(SAMPLE_RATE_HZ),
+        .MIN_FREQUENCY_HZ(DPLL_MIN_FREQUENCY_HZ),
+        .MAX_FREQUENCY_HZ(DPLL_MAX_FREQUENCY_HZ),
+        .COARSE_STEP_HZ(DPLL_COARSE_STEP_HZ),
+        .COARSE_WINDOW_SAMPLES(
+            DPLL_COARSE_WINDOW_SAMPLES),
+        .FINE_RADIUS_STEPS(DPLL_FINE_RADIUS_STEPS),
+        .FINE_WINDOW_SAMPLES(
+            DPLL_FINE_WINDOW_SAMPLES),
+        .TRACK_WINDOW_SAMPLES(
+            DPLL_TRACK_WINDOW_SAMPLES),
+        .LOW_TRACK_WINDOW_SAMPLES(
+            DPLL_LOW_TRACK_WINDOW_SAMPLES),
+        .LOW_TRACK_THRESHOLD_HZ(
+            DPLL_LOW_TRACK_THRESHOLD_HZ)
+    ) u_continuous_iq_dpll (
         .clk(clk),
         .rst_n(rst_n),
-        .start(phase_step_start),
-        .divisor(phase_divisor),
-        .busy(phase_divider_busy),
-        .valid(phase_step_valid),
-        .quotient(phase_step_quotient)
+        .sample_ce(sample_ce),
+        .enable(wired_dpll_enable),
+        .input_sample(current_sample),
+        .tracking_active(dpll_tracking_active),
+        .locked(dpll_locked),
+        .tracked_phase(dpll_tracked_phase),
+        .tracked_phase_step(wired_dpll_phase_step),
+        .phase_error_word(dpll_phase_error_word)
+    );
+
+    // This is the independent frequency-only calibration/holdover path used
+    // by DAC2 and wireless mode. It never controls the wired DAC1 DPLL.
+    reference_frequency_calibrator #(
+        .SAMPLE_RATE_HZ(SAMPLE_RATE_HZ),
+        .TARGET_FREQUENCY_HZ(FREQUENCY_CAL_TARGET_HZ),
+        .BLOCK_SAMPLES(FREQUENCY_CAL_BLOCK_SAMPLES),
+        .AVERAGING_BLOCKS(FREQUENCY_CAL_AVERAGING_BLOCKS)
+    ) u_reference_frequency_calibrator (
+        .clk(clk),
+        .rst_n(rst_n),
+        .sample_ce(sample_ce),
+        .start(frequency_cal_start_pulse),
+        .input_sample(current_sample),
+        .active(frequency_cal_active),
+        .locked(frequency_cal_locked),
+        .phase_step(frequency_cal_phase_step),
+        .measured_samples(frequency_cal_measured_samples)
     );
 
     dds_sine_lut u_dds_sine_lut (
-        .phase(dds_phase),
+        .phase(selected_phase_reg),
         .sine_sample(dds_sample)
     );
 
     always @* begin
-        centered_wide = $signed({1'b0, ad_data}) - ADC_MID_CODE;
+        centered_wide =
+            $signed({1'b0, ad_data}) - ADC_MID_CODE;
         current_sample = clamp_to_cal(centered_wide);
-        feedback_centered_wide =
-            $signed({1'b0, ad_feedback_data}) - ADC_MID_CODE;
-        feedback_sample = clamp_to_cal(feedback_centered_wide);
 
-        rising_crossing = crossing_armed &&
-                          (current_sample >= ZERO_HYST_CODE);
-        feedback_rising_crossing = feedback_crossing_armed &&
-                                   (feedback_sample >= ZERO_HYST_CODE);
-        period_candidate = {1'b0, period_counter} + 1'b1;
-
-        if (rising_crossing) begin
-            feedback_delay_candidate = 17'd0;
-        end else begin
-            feedback_delay_candidate =
-                {1'b0, feedback_age_counter} + 1'b1;
-        end
-
-        if ((measured_period != 16'd0) &&
-            (feedback_delay_candidate >
-             ({1'b0, measured_period} >> 1))) begin
-            feedback_error_candidate =
-                $signed(feedback_delay_candidate) -
-                $signed({1'b0, measured_period});
-        end else begin
-            feedback_error_candidate =
-                $signed(feedback_delay_candidate);
-        end
-
-        if (phase_calibration_samples[7]) begin
-            phase_calibration_magnitude =
-                (~phase_calibration_samples) + 1'b1;
-            phase_calibration_adjust =
-                32'd0 -
-                (active_phase_step * phase_calibration_magnitude);
-        end else begin
-            phase_calibration_magnitude =
-                phase_calibration_samples[7:0];
-            phase_calibration_adjust =
-                active_phase_step * phase_calibration_magnitude;
-        end
-
-        phase_calibration_sum =
-            {{9{phase_calibration_samples[7]}},
-             phase_calibration_samples} +
-            feedback_error_candidate;
-
-        if (period_candidate >= {1'b0, phase_calibration_period}) begin
-            calibration_period_difference =
-                period_candidate - {1'b0, phase_calibration_period};
-        end else begin
-            calibration_period_difference =
-                {1'b0, phase_calibration_period} - period_candidate;
-        end
-
-        frequency_change_threshold = phase_calibration_period >> 8;
-        if (frequency_change_threshold < 16'd2) begin
-            frequency_change_threshold = 16'd2;
-        end
-        frequency_change_detected =
-            phase_cal_locked &&
-            (phase_calibration_period != 16'd0) &&
-            (calibration_period_difference >
-             {1'b0, frequency_change_threshold});
-
-        // Manual trim represents an angle, not a time delay. It is therefore
-        // independent of input frequency. Hide it while automatic delay
-        // calibration is unlocked so the two corrections cannot cancel.
-        if (phase_cal_locked) begin
-            manual_phase_adjust = manual_phase_trim_word[31:0];
-        end else begin
-            manual_phase_adjust = 32'd0;
-        end
-
-        if (rising_crossing && phase_step_ready) begin
-            base_phase = 32'd0;
-        end else begin
-            base_phase = phase_accumulator;
-        end
-
-        compensated_phase = base_phase +
-            (active_phase_step * PHASE_PIPELINE_COMP_SAMPLES) +
-            phase_calibration_adjust;
+        pipeline_phase_product =
+            wired_dpll_phase_step *
+            PHASE_PIPELINE_COMP_Q8;
+        pipeline_phase_compensation =
+            pipeline_phase_compensation_reg;
+        compensated_phase =
+            dpll_tracked_phase +
+            pipeline_phase_compensation;
 
         case (mode_sel)
             MODE_DIRECT:
-                dds_phase = compensated_phase + manual_phase_adjust;
+                selected_phase_next = compensated_phase;
             MODE_QUADRATURE:
-                dds_phase = compensated_phase + PHASE_QUARTER +
-                            manual_phase_adjust;
+                selected_phase_next =
+                    compensated_phase + PHASE_QUARTER;
             MODE_DOUBLE:
-                dds_phase = (compensated_phase << 1) +
-                            manual_phase_adjust;
-            default: dds_phase = 32'd0;
+                selected_phase_next = compensated_phase << 1;
+            default:
+                selected_phase_next = compensated_phase;
         endcase
 
-        if (period_locked ||
-            (rising_crossing && phase_step_ready)) begin
-            selected_sample = dds_sample;
-        end else begin
-            selected_sample = 11'sd0;
-        end
+        amplitude_scaled_sample =
+            scale_for_amplitude(
+                dds_sample_reg,
+                amplitude_sel_dds_reg);
 
-        scaled_sample = apply_amplitude(selected_sample, amplitude_sel);
+        period_locked = dpll_locked;
+        phase_cal_locked = dpll_locked;
+        measured_period = 17'd0;
+        phase_error_q8 =
+            dpll_phase_error_word[31:16];
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            pipeline_phase_compensation_reg <= 32'd0;
+            selected_phase_reg <= 32'd0;
+            dds_sample_reg <= 11'sd0;
+            amplitude_sel_phase_reg <= 2'd3;
+            amplitude_sel_dds_reg <= 2'd3;
+            phase_valid_reg <= 1'b0;
+            dds_valid_reg <= 1'b0;
             da_data <= DAC_MID_CODE[9:0];
-            period_locked <= 1'b0;
-            measured_period <= 16'd0;
-            crossing_armed <= 1'b0;
-            crossing_seen <= 1'b0;
-            period_counter <= 16'd0;
-            phase_step_start <= 1'b0;
-            phase_divisor <= 16'd1;
-            pending_phase_step <= 32'd0;
-            active_phase_step <= 32'd0;
-            phase_step_ready <= 1'b0;
-            phase_accumulator <= 32'd0;
-            feedback_crossing_armed <= 1'b0;
-            feedback_age_counter <= 16'd0;
-            phase_calibration_samples <= 8'sd0;
-            manual_phase_trim_word <= 33'sd0;
-            phase_calibration_period <= 16'd0;
-            phase_stable_count <= 3'd0;
-            phase_cal_locked <= 1'b0;
-            phase_error_samples <= 17'sd0;
-        end else begin
-            phase_step_start <= 1'b0;
+        end else if (sample_ce) begin
+            // Register each expensive stage separately:
+            // phase selection -> interpolated LUT -> amplitude/DAC code.
+            pipeline_phase_compensation_reg <=
+                pipeline_phase_product[55:24];
+            selected_phase_reg <= selected_phase_next;
+            amplitude_sel_phase_reg <= amplitude_sel;
+            phase_valid_reg <= dpll_tracking_active;
+            dds_sample_reg <= dds_sample;
+            amplitude_sel_dds_reg <= amplitude_sel_phase_reg;
+            dds_valid_reg <= phase_valid_reg;
 
-            if (!phase_cal_enable) begin
-                phase_stable_count <= 3'd0;
-                phase_cal_locked <= 1'b0;
-            end
-
-            // KEY5/KEY6 are a post-lock fixed-angle trim. One count is about
-            // 0.1 degree and is retained across frequency/mode changes.
-            // Simultaneous presses intentionally cancel.
-            if (phase_cal_enable && phase_cal_locked) begin
-                if (fine_phase_inc_pulse && !fine_phase_dec_pulse &&
-                    (manual_phase_trim_word <=
-                     MAX_MANUAL_PHASE - MANUAL_PHASE_STEP)) begin
-                    manual_phase_trim_word <=
-                        manual_phase_trim_word + MANUAL_PHASE_STEP;
-                end else if (fine_phase_dec_pulse &&
-                             !fine_phase_inc_pulse &&
-                             (manual_phase_trim_word >=
-                              MIN_MANUAL_PHASE + MANUAL_PHASE_STEP)) begin
-                    manual_phase_trim_word <=
-                        manual_phase_trim_word - MANUAL_PHASE_STEP;
-                end
-            end
-
-            if (phase_step_valid) begin
-                pending_phase_step <= phase_step_quotient;
-                phase_step_ready <= 1'b1;
-            end
-
-            if (sample_ce) begin
-                da_data <= signed_to_dac(scaled_sample);
-
-                if (current_sample <= -ZERO_HYST_CODE) begin
-                    crossing_armed <= 1'b1;
-                end
-                if (feedback_sample <= -ZERO_HYST_CODE) begin
-                    feedback_crossing_armed <= 1'b1;
-                end
-
-                if (rising_crossing) begin
-                    feedback_age_counter <= 16'd0;
-                end else if (feedback_age_counter != 16'hffff) begin
-                    feedback_age_counter <=
-                        feedback_age_counter + 1'b1;
-                end
-
-                if (feedback_rising_crossing) begin
-                    feedback_crossing_armed <= 1'b0;
-
-                    if (phase_cal_enable &&
-                        (mode_sel == MODE_DIRECT) &&
-                        period_locked) begin
-                        phase_error_samples <=
-                            feedback_error_candidate;
-
-                        // Once locked, freeze the automatic whole-sample
-                        // correction so it cannot oppose the manual trim.
-                        if (phase_cal_locked) begin
-                            phase_cal_locked <= 1'b1;
-                        end else if ((feedback_error_candidate >= -17'sd1) &&
-                            (feedback_error_candidate <= 17'sd1)) begin
-                            if (phase_stable_count >=
-                                PHASE_LOCK_CONFIRM_CYCLES - 1) begin
-                                phase_cal_locked <= 1'b1;
-                                phase_calibration_period <= measured_period;
-                            end else begin
-                                phase_stable_count <=
-                                    phase_stable_count + 1'b1;
-                            end
-                        end else if ((feedback_error_candidate > 17'sd1) &&
-                                     (phase_calibration_samples <
-                                      MAX_PHASE_CAL_SAMPLES)) begin
-                            if (phase_calibration_sum >
-                                MAX_PHASE_CAL_SAMPLES) begin
-                                phase_calibration_samples <=
-                                    MAX_PHASE_CAL_SAMPLES;
-                            end else begin
-                                phase_calibration_samples <=
-                                    phase_calibration_sum[7:0];
-                            end
-                            phase_stable_count <= 3'd0;
-                            phase_cal_locked <= 1'b0;
-                        end else if ((feedback_error_candidate < -17'sd1) &&
-                                     (phase_calibration_samples >
-                                      -MAX_PHASE_CAL_SAMPLES)) begin
-                            if (phase_calibration_sum <
-                                -MAX_PHASE_CAL_SAMPLES) begin
-                                phase_calibration_samples <=
-                                    -MAX_PHASE_CAL_SAMPLES;
-                            end else begin
-                                phase_calibration_samples <=
-                                    phase_calibration_sum[7:0];
-                            end
-                            phase_stable_count <= 3'd0;
-                            phase_cal_locked <= 1'b0;
-                        end
-                    end
-                end
-
-                if (rising_crossing) begin
-                    crossing_armed <= 1'b0;
-                    period_counter <= 16'd0;
-
-                    if (crossing_seen &&
-                        (period_candidate >= MIN_VALID_PERIOD) &&
-                        (period_candidate <= MAX_VALID_PERIOD) &&
-                        !phase_divider_busy) begin
-                        measured_period <= period_candidate[15:0];
-                        phase_divisor <= period_candidate[15:0];
-                        phase_step_start <= 1'b1;
-
-                        // A lock is valid only for the frequency at which its
-                        // analog-loop delay was measured. Reacquire after a
-                        // significant period change; normal +/-1 sample
-                        // crossing jitter is ignored.
-                        if (frequency_change_detected) begin
-                            phase_cal_locked <= 1'b0;
-                            phase_stable_count <= 3'd0;
-                            phase_calibration_period <=
-                                period_candidate[15:0];
-                        end
-                    end
-                    crossing_seen <= 1'b1;
-
-                    if (phase_step_ready) begin
-                        active_phase_step <= pending_phase_step;
-                        phase_accumulator <= pending_phase_step;
-                        period_locked <= 1'b1;
-                    end
-                end else begin
-                    if (period_counter != 16'hffff) begin
-                        period_counter <= period_counter + 1'b1;
-                    end
-                    if (period_locked) begin
-                        phase_accumulator <=
-                            phase_accumulator + active_phase_step;
-                    end
-                end
+            if (dds_valid_reg) begin
+                da_data <=
+                    signed_to_dac(amplitude_scaled_sample);
+            end else begin
+                da_data <= DAC_MID_CODE[9:0];
             end
         end
     end

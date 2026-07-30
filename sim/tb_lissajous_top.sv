@@ -1,15 +1,9 @@
 `timescale 1ns/1ps
 
 module tb_lissajous_top;
-
-    localparam integer SYS_CLK_HZ = 100_000_000;
-    localparam integer CONVERTER_CLK_HZ = 12_500_000;
-    localparam integer INPUT_FREQ_HZ = 100_000;
-    localparam integer INPUT_PERIOD_SAMPLES =
-        CONVERTER_CLK_HZ / INPUT_FREQ_HZ;
-    localparam integer LOW_FREQ_HZ = 1_000;
-    localparam integer LOW_FREQ_PERIOD_SAMPLES =
-        CONVERTER_CLK_HZ / LOW_FREQ_HZ;
+    localparam integer CONVERTER_CLK_HZ = 30_000_000;
+    localparam integer ADC_MID_CODE = 512;
+    localparam integer ADC_PEAK_CODE = 205;
 
     logic pl_clk_50m;
     logic key1_n;
@@ -29,41 +23,40 @@ module tb_lissajous_top;
     logic da_clk;
     logic da2_clk;
     logic [3:0] led_n;
-    logic [9:0] feedback_delay_0;
-    logic [9:0] feedback_delay_1;
-    logic [9:0] feedback_delay_2;
-    logic signed [32:0] fine_trim_before;
 
-    real phase_rad;
-    real phase_step;
-    real source_real;
-    realtime clock_edge_1;
-    realtime clock_edge_2;
-    integer source_integer;
-    integer error_count;
-    integer pp_value;
-    integer max_value;
-    integer min_value;
-    integer crossing_count;
-    integer previous_y;
-    integer current_y;
-    integer sample_index;
-    integer lock_wait_count;
-    integer phase_cal_wait_count;
-    longint signed correlation;
-    longint signed x_energy;
+    real source_phase;
+    real source_frequency_hz;
+    real source_value;
+    real measured_frequency_hz;
     real correlation_ratio;
+    integer source_code;
+    integer error_count;
+    integer wait_count;
+    integer sample_index;
+    integer sample_value;
+    integer min_value;
+    integer max_value;
+    integer peak_to_peak;
+    integer previous_value;
+    integer transition_count;
+    longint signed correlation;
+    longint signed input_energy;
+    logic [1:0] saved_mode;
+    logic [1:0] saved_amplitude;
 
     lissajous_top #(
-        .SYS_CLK_HZ(SYS_CLK_HZ),
-        .CONVERTER_CLK_HZ(CONVERTER_CLK_HZ),
         .SOFT_RESET_CYCLES(8),
         .DEBOUNCE_CYCLES(4),
-        .PHASE_HOLD_DELAY_CYCLES(100),
-        .PHASE_REPEAT_CYCLES(20),
-        .ADC_MID_CODE(512),
-        .DAC_MID_CODE(512),
-        .CAL_PEAK_CODE(256)
+        // Keep the end-to-end regression fast while still exercising both
+        // ends of the required 1 kHz to 100 kHz acquisition range.
+        .DPLL_MIN_FREQUENCY_HZ(1_000),
+        .DPLL_MAX_FREQUENCY_HZ(110_000),
+        .DPLL_COARSE_STEP_HZ(99_000),
+        .DPLL_COARSE_WINDOW_SAMPLES(30_000),
+        .DPLL_FINE_RADIUS_STEPS(0),
+        .DPLL_FINE_WINDOW_SAMPLES(30_000),
+        .DPLL_TRACK_WINDOW_SAMPLES(32_768),
+        .DPLL_LOW_TRACK_WINDOW_SAMPLES(262_144)
     ) dut (
         .pl_clk_50m(pl_clk_50m),
         .key1_n(key1_n),
@@ -87,48 +80,32 @@ module tb_lissajous_top;
 
     always #10 pl_clk_50m = ~pl_clk_50m;
 
-    // Generic offset-binary ADC model. Data changes after each ADC rising edge
-    // and is stable by the FPGA capture point at the falling edge.
     always @(posedge ad_clk) begin
         if (dut.rst_n) begin
-            source_real = 256.0 * $sin(phase_rad);
-            source_integer = $rtoi(source_real);
-            ad_data <= 512 + source_integer;
-            phase_rad = phase_rad + phase_step;
-            if (phase_rad >= 6.283185307179586) begin
-                phase_rad = phase_rad - 6.283185307179586;
-            end
+            source_value =
+                ADC_PEAK_CODE * $sin(source_phase);
+            source_code = $rtoi(source_value);
+            ad_data <= ADC_MID_CODE + source_code;
+            source_phase = source_phase +
+                6.283185307179586 *
+                source_frequency_hz /
+                CONVERTER_CLK_HZ;
+            if (source_phase >= 6.283185307179586)
+                source_phase =
+                    source_phase - 6.283185307179586;
         end
     end
 
-    always @(posedge ad2_clk) begin
-        if (dut.rst_n) begin
-            // The real DAC analog path inverts polarity. The top-level
-            // bitwise inversion compensates it before this loopback point.
-            feedback_delay_0 <= ~da2_data;
-            feedback_delay_1 <= feedback_delay_0;
-            feedback_delay_2 <= feedback_delay_1;
-            ad2_data <= feedback_delay_2;
-        end
-    end
-
-    task automatic wait_dac_samples(input integer count);
-        integer index;
+    function automatic integer logical_dac_code(
+        input logic [9:0] physical_code
+    );
         begin
-            for (index = 0; index < count; index = index + 1) begin
-                @(posedge da_clk);
-            end
+            if (physical_code == 0)
+                logical_dac_code = 1023;
+            else
+                logical_dac_code = 1024 - physical_code;
         end
-    endtask
-
-    task automatic press_key1;
-        begin
-            key1_n = 1'b0;
-            repeat (10) @(posedge pl_clk_50m);
-            key1_n = 1'b1;
-            repeat (10) @(posedge pl_clk_50m);
-        end
-    endtask
+    endfunction
 
     task automatic press_key2;
         begin
@@ -136,6 +113,7 @@ module tb_lissajous_top;
             repeat (10) @(posedge pl_clk_50m);
             key2_n = 1'b1;
             repeat (10) @(posedge pl_clk_50m);
+            repeat (4) @(posedge da_clk);
         end
     endtask
 
@@ -145,15 +123,7 @@ module tb_lissajous_top;
             repeat (10) @(posedge pl_clk_50m);
             key3_n = 1'b1;
             repeat (10) @(posedge pl_clk_50m);
-        end
-    endtask
-
-    task automatic press_key4;
-        begin
-            key4_n = 1'b0;
-            repeat (10) @(posedge pl_clk_50m);
-            key4_n = 1'b1;
-            repeat (10) @(posedge pl_clk_50m);
+            repeat (4) @(posedge da_clk);
         end
     endtask
 
@@ -163,77 +133,113 @@ module tb_lissajous_top;
             repeat (10) @(posedge pl_clk_50m);
             key5_n = 1'b1;
             repeat (10) @(posedge pl_clk_50m);
+            repeat (4) @(posedge da_clk);
         end
     endtask
 
-    task automatic press_key6;
+    task automatic wait_for_lock(
+        input real expected_frequency_hz,
+        input integer maximum_samples
+    );
         begin
-            key6_n = 1'b0;
-            repeat (10) @(posedge pl_clk_50m);
-            key6_n = 1'b1;
-            repeat (10) @(posedge pl_clk_50m);
+            wait_count = 0;
+            while (!dut.period_locked &&
+                   (wait_count < maximum_samples)) begin
+                @(posedge da_clk);
+                wait_count = wait_count + 1;
+            end
+            repeat (200_000) @(posedge da_clk);
+            measured_frequency_hz =
+                (1.0 * dut.wired_dpll_phase_step *
+                 CONVERTER_CLK_HZ) /
+                281474976710656.0;
+            if (!dut.period_locked ||
+                (measured_frequency_hz <
+                 expected_frequency_hz - 0.02) ||
+                (measured_frequency_hz >
+                 expected_frequency_hz + 0.02)) begin
+                $display("[CHECK FAIL] DPLL expected=%0.3fHz measured=%0.6fHz locked=%0b",
+                         expected_frequency_hz,
+                         measured_frequency_hz,
+                         dut.period_locked);
+                error_count = error_count + 1;
+            end else begin
+                $display("[CHECK PASS] DPLL locked %0.3fHz as %0.6fHz",
+                         expected_frequency_hz,
+                         measured_frequency_hz);
+            end
         end
     endtask
 
     task automatic measure_peak_to_peak(
-        input integer count,
-        output integer peak_to_peak
+        input integer count
     );
-        integer index;
-        integer sample_value;
         begin
-            max_value = -2_000_000;
-            min_value = 2_000_000;
-            for (index = 0; index < count; index = index + 1) begin
+            min_value = 1023;
+            max_value = 0;
+            for (sample_index = 0;
+                 sample_index < count;
+                 sample_index = sample_index + 1) begin
                 @(posedge da_clk);
                 #1;
-                sample_value = $signed({1'b0, da_data}) - 512;
-                if (sample_value > max_value) max_value = sample_value;
-                if (sample_value < min_value) min_value = sample_value;
+                sample_value = logical_dac_code(da_data);
+                if (sample_value < min_value)
+                    min_value = sample_value;
+                if (sample_value > max_value)
+                    max_value = sample_value;
             end
             peak_to_peak = max_value - min_value;
         end
     endtask
 
-    task automatic check_pp(
+    task automatic expect_peak_to_peak(
         input integer expected,
         input integer tolerance,
-        input [8*32-1:0] label_text
+        input [8*24-1:0] label_text
     );
         begin
-            wait_dac_samples(40);
-            measure_peak_to_peak(INPUT_PERIOD_SAMPLES * 3, pp_value);
-            if ((pp_value < expected - tolerance) ||
-                (pp_value > expected + tolerance)) begin
-                $display("[CHECK FAIL] %0s p-p=%0d expected=%0d +/- %0d",
-                         label_text, pp_value, expected, tolerance);
+            measure_peak_to_peak(3_000);
+            if ((peak_to_peak < expected - tolerance) ||
+                (peak_to_peak > expected + tolerance)) begin
+                $display("[CHECK FAIL] %0s p-p=%0d expected=%0d",
+                         label_text, peak_to_peak, expected);
                 error_count = error_count + 1;
             end else begin
-                $display("[CHECK PASS] %0s p-p=%0d", label_text, pp_value);
+                $display("[CHECK PASS] %0s p-p=%0d",
+                         label_text, peak_to_peak);
             end
         end
     endtask
 
-    task automatic check_led_state(
-        input logic [3:0] expected_led_n,
-        input [8*32-1:0] label_text
-    );
+    task automatic measure_correlation(input integer count);
         begin
-            #1;
-            if (led_n !== expected_led_n) begin
-                $display("[CHECK FAIL] %0s LED=%b expected=%b",
-                         label_text, led_n, expected_led_n);
-                error_count = error_count + 1;
-            end else begin
-                $display("[CHECK PASS] %0s LED=%b",
-                         label_text, led_n);
+            correlation = 0;
+            input_energy = 0;
+            for (sample_index = 0;
+                 sample_index < count;
+                 sample_index = sample_index + 1) begin
+                @(posedge da_clk);
+                #1;
+                correlation = correlation +
+                    (($signed({1'b0, ad_data}) - ADC_MID_CODE) *
+                     (logical_dac_code(da_data) - ADC_MID_CODE));
+                input_energy = input_energy +
+                    (($signed({1'b0, ad_data}) - ADC_MID_CODE) *
+                     ($signed({1'b0, ad_data}) - ADC_MID_CODE));
             end
+            correlation_ratio =
+                (1.0 * correlation) / input_energy;
         end
     endtask
 
     initial begin
         $dumpfile("sim/tb_lissajous_top.vcd");
-        $dumpvars(0, tb_lissajous_top);
+        $dumpvars(1, tb_lissajous_top);
+        $dumpvars(0, dut.converter_clk_30m);
+        $dumpvars(0, dut.period_locked);
+        $dumpvars(0, dut.wired_dpll_phase_step);
+        $dumpvars(0, dut.core_mode_sel);
+        $dumpvars(0, dut.core_amplitude_sel);
 
         pl_clk_50m = 1'b0;
         key1_n = 1'b1;
@@ -242,480 +248,109 @@ module tb_lissajous_top;
         key4_n = 1'b1;
         key5_n = 1'b1;
         key6_n = 1'b1;
-        ad_data = 10'd512;
-        ad2_data = 10'd512;
-        feedback_delay_0 = 10'd512;
-        feedback_delay_1 = 10'd512;
-        feedback_delay_2 = 10'd512;
-        phase_rad = 0.0;
-        phase_step = 6.283185307179586 *
-                     INPUT_FREQ_HZ / CONVERTER_CLK_HZ;
+        ad_data = ADC_MID_CODE;
+        ad2_data = ADC_MID_CODE;
+        source_phase = 0.731;
+        source_frequency_hz = 100_000.0;
         error_count = 0;
 
-        #1;
-        if (dut.rst_n !== 1'b0) begin
-            $display("[CHECK FAIL] internal soft reset did not start active");
-            error_count = error_count + 1;
-        end
-        @(posedge dut.rst_n);
-        $display("[CHECK PASS] internal soft reset released automatically");
+        wait (dut.converter_rst_n === 1'b1);
+        wait_for_lock(100_000.0, 500_000);
 
-        if (dut.wireless_mode !== 1'b0 ||
-            dut.mode_sel !== 2'd0 ||
-            dut.amplitude_sel !== 2'd3) begin
-            $display("[CHECK FAIL] reset control/LED state is incorrect");
+        measure_correlation(3_000);
+        if (correlation_ratio < 0.95) begin
+            $display("[CHECK FAIL] direct phase correlation=%0.4f",
+                     correlation_ratio);
             error_count = error_count + 1;
         end else begin
-            $display("[CHECK PASS] reset selects wired/direct/8div");
+            $display("[CHECK PASS] direct phase correlation=%0.4f",
+                     correlation_ratio);
         end
-        check_led_state(4'b1111, "reset direct/8div");
 
-        @(posedge dut.sys_clk_100m);
-        clock_edge_1 = $realtime;
-        @(posedge dut.sys_clk_100m);
-        clock_edge_2 = $realtime;
-        if ((clock_edge_2 - clock_edge_1) != 10.0ns) begin
-            $display("[CHECK FAIL] PLL system clock period is %0t, expected 10ns",
-                     clock_edge_2 - clock_edge_1);
+        expect_peak_to_peak(410, 2, "full amplitude");
+        press_key3();
+        expect_peak_to_peak(102, 2, "quarter amplitude");
+        press_key3();
+        expect_peak_to_peak(205, 2, "half amplitude");
+        press_key3();
+        expect_peak_to_peak(307, 2, "three-quarter amplitude");
+        press_key3();
+        expect_peak_to_peak(410, 2, "full amplitude restored");
+
+        press_key2();
+        measure_correlation(3_000);
+        if ((correlation_ratio < -0.10) ||
+            (correlation_ratio > 0.10)) begin
+            $display("[CHECK FAIL] quadrature correlation=%0.4f",
+                     correlation_ratio);
             error_count = error_count + 1;
         end else begin
-            $display("[CHECK PASS] PLL placeholder output is 100MHz");
+            $display("[CHECK PASS] quadrature mode correlation=%0.4f",
+                     correlation_ratio);
         end
 
-        @(posedge ad_clk);
-        clock_edge_1 = $realtime;
-        @(posedge ad_clk);
-        clock_edge_2 = $realtime;
-        if ((clock_edge_2 - clock_edge_1) != 80.0ns) begin
-            $display("[CHECK FAIL] AD/DA clock period is %0t, expected 80ns",
-                     clock_edge_2 - clock_edge_1);
+        press_key2();
+        previous_value = logical_dac_code(da_data);
+        transition_count = 0;
+        repeat (3_000) begin
+            @(posedge da_clk);
+            #1;
+            sample_value = logical_dac_code(da_data);
+            if ((previous_value < ADC_MID_CODE) &&
+                (sample_value >= ADC_MID_CODE))
+                transition_count = transition_count + 1;
+            previous_value = sample_value;
+        end
+        if ((transition_count < 18) ||
+            (transition_count > 22)) begin
+            $display("[CHECK FAIL] double-frequency cycles=%0d expected=20",
+                     transition_count);
             error_count = error_count + 1;
         end else begin
-            $display("[CHECK PASS] AD/DA clock is 12.5MHz");
+            $display("[CHECK PASS] double-frequency cycles=%0d",
+                     transition_count);
+        end
+        press_key2();
+
+        saved_mode = dut.core_mode_sel;
+        saved_amplitude = dut.core_amplitude_sel;
+        press_key5();
+        if ((dut.core_mode_sel !== saved_mode) ||
+            (dut.core_amplitude_sel !== saved_amplitude) ||
+            (dut.core_dac2_reference_frequency_sel !== 1'b1)) begin
+            $display("[CHECK FAIL] KEY5 changed DAC1 controls");
+            error_count = error_count + 1;
+        end else begin
+            $display("[CHECK PASS] KEY5 affects only DAC2 frequency selection");
         end
 
-        #1;
+        source_phase = 2.137;
+        source_frequency_hz = 1_000.0;
+        wait (dut.period_locked === 1'b0);
+        wait_for_lock(1_000.0, 2_000_000);
+        measure_correlation(30_000);
+        if (correlation_ratio < 0.95) begin
+            $display("[CHECK FAIL] 1kHz reacquired correlation=%0.4f",
+                     correlation_ratio);
+            error_count = error_count + 1;
+        end else begin
+            $display("[CHECK PASS] 1kHz reacquired correlation=%0.4f",
+                     correlation_ratio);
+        end
+
         if ((ad_oe_n !== 1'b0) ||
             (ad2_oe_n !== 1'b0)) begin
-            $display("[CHECK FAIL] both ADC OE outputs must be active");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] both ADC OE outputs are active");
-        end
-
-        if ((ad2_clk !== ad_clk) || (da2_clk !== da_clk)) begin
-            $display("[CHECK FAIL] per-channel converter clocks differ");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] per-channel clocks are separate and synchronous");
-        end
-
-        lock_wait_count = 0;
-        while (!dut.period_locked &&
-               (lock_wait_count < INPUT_PERIOD_SAMPLES * 6)) begin
-            @(posedge da_clk);
-            lock_wait_count = lock_wait_count + 1;
-        end
-        if (!dut.period_locked) begin
-            $display("[CHECK FAIL] frequency measurement/DDS did not lock");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] frequency measurement/DDS locked in %0d samples",
-                     lock_wait_count);
-        end
-
-        // Fine trim must remain disabled until the feedback calibration locks.
-        press_key5();
-        if (dut.u_lissajous_core.manual_phase_trim_word !== 33'sd0) begin
-            $display("[CHECK FAIL] KEY5 changed phase before calibration lock");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] phase fine trim is disabled before lock");
-        end
-
-        phase_cal_wait_count = 0;
-        while (!dut.phase_cal_locked &&
-               (phase_cal_wait_count < INPUT_PERIOD_SAMPLES * 20)) begin
-            @(posedge da_clk);
-            phase_cal_wait_count = phase_cal_wait_count + 1;
-        end
-        if (!dut.phase_cal_locked) begin
-            $display("[CHECK FAIL] AD2 feedback phase calibration did not lock");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] AD2 feedback phase calibration locked in %0d samples, correction=%0d samples, residual=%0d",
-                     phase_cal_wait_count,
-                     dut.u_lissajous_core.phase_calibration_samples,
-                     dut.phase_error_samples);
-        end
-
-        // One short press is a frequency-independent 0.1 degree step.
-        fine_trim_before =
-            $signed(dut.u_lissajous_core.manual_phase_trim_word);
-        press_key5();
-        if ($signed(dut.u_lissajous_core.manual_phase_trim_word) !==
-            fine_trim_before +
-            $signed({1'b0,
-                     dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD})) begin
-            $display("[CHECK FAIL] KEY5 fixed-angle increment is incorrect");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY5 advances phase by 0.1 degree");
-        end
-        #1;
-        if (dut.u_lissajous_core.manual_phase_adjust !==
-            dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD) begin
-            $display("[CHECK FAIL] positive fixed-angle DDS word is incorrect");
-            error_count = error_count + 1;
-        end
-        if (!dut.phase_cal_locked) begin
-            $display("[CHECK FAIL] manual trim disturbed phase lock state");
+            $display("[CHECK FAIL] ADC output enables are not active");
             error_count = error_count + 1;
         end
 
-        press_key6();
-        if ($signed(dut.u_lissajous_core.manual_phase_trim_word) !==
-            fine_trim_before) begin
-            $display("[CHECK FAIL] KEY6 fixed-angle decrement is incorrect");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY6 retards phase by 0.1 degree");
-        end
-
-        press_key6();
-        #1;
-        if (($signed(dut.u_lissajous_core.manual_phase_trim_word) !==
-             fine_trim_before -
-             $signed({1'b0,
-                      dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD})) ||
-            (dut.u_lissajous_core.manual_phase_adjust !==
-             (32'd0 -
-              dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD))) begin
-            $display("[CHECK FAIL] negative fixed-angle DDS word is incorrect");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] negative fixed-angle trim is correct");
-        end
-        press_key5();
-
-        if (da2_data !== da_data) begin
-            $display("[CHECK FAIL] DAC channel 2 does not copy channel 1");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] DAC channel 2 copies channel 1");
-        end
-
-        correlation = 0;
-        x_energy = 0;
-        for (sample_index = 0;
-             sample_index < INPUT_PERIOD_SAMPLES * 4;
-             sample_index = sample_index + 1) begin
-            @(posedge da_clk);
-            #1;
-            correlation = correlation +
-                (($signed({1'b0, ad_data}) - 512) *
-                 ($signed({1'b0, ad2_data}) - 512));
-            x_energy = x_energy +
-                (($signed({1'b0, ad_data}) - 512) *
-                 ($signed({1'b0, ad_data}) - 512));
-        end
-        correlation_ratio = (1.0 * correlation) / x_energy;
-        if (correlation_ratio < 0.95) begin
-            $display("[CHECK FAIL] calibrated AD2 feedback correlation=%0.4f",
-                     correlation_ratio);
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] calibrated AD2 feedback correlation=%0.4f",
-                     correlation_ratio);
-        end
-        wait_dac_samples(INPUT_PERIOD_SAMPLES);
-
-        // Requirement 1 and requirement 4 amplitude selections.
-        check_pp(512, 10, "direct 8div");
-        press_key3();
-        check_led_state(4'b1111, "wired KEY3 2div");
-        check_pp(128, 8, "direct 2div");
-        press_key3();
-        check_led_state(4'b1111, "wired KEY3 4div");
-        check_pp(256, 8, "direct 4div");
-        press_key3();
-        check_led_state(4'b1111, "wired KEY3 6div");
-        check_pp(384, 10, "direct 6div");
-        press_key3();
-        check_led_state(4'b1111, "wired KEY3 8div");
-        check_pp(512, 10, "direct 8div restore");
-
-        // Requirement 2: AD2 is the measured analog-loopback phase. Equal
-        // amplitude at the DAC and approximately zero AD1/AD2 correlation
-        // indicate a calibrated quadrature output.
-        press_key2();
-        if (dut.mode_sel !== 2'd1) begin
-            $display("[CHECK FAIL] KEY2 did not cycle to quadrature");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY2 cycles to quadrature");
-        end
-        check_led_state(4'b1111, "wired quadrature/8div");
-        wait_dac_samples(INPUT_PERIOD_SAMPLES * 3);
-        check_pp(512, 12, "quadrature 8div");
-
-        correlation = 0;
-        x_energy = 0;
-        for (sample_index = 0;
-             sample_index < INPUT_PERIOD_SAMPLES * 4;
-             sample_index = sample_index + 1) begin
-            @(posedge da_clk);
-            #1;
-            correlation = correlation +
-                (($signed({1'b0, ad_data}) - 512) *
-                 ($signed({1'b0, ad2_data}) - 512));
-            x_energy = x_energy +
-                (($signed({1'b0, ad_data}) - 512) *
-                 ($signed({1'b0, ad_data}) - 512));
-        end
-        correlation_ratio = (1.0 * correlation) / x_energy;
-        if ((correlation_ratio < -0.12) ||
-            (correlation_ratio > 0.12)) begin
-            $display("[CHECK FAIL] quadrature correlation ratio=%0.4f",
-                     correlation_ratio);
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] quadrature correlation ratio=%0.4f",
-                     correlation_ratio);
-        end
-
-        if (!dut.period_locked ||
-            (dut.measured_period < INPUT_PERIOD_SAMPLES - 1) ||
-            (dut.measured_period > INPUT_PERIOD_SAMPLES + 1)) begin
-            $display("[CHECK FAIL] measured period=%0d expected=%0d",
-                     dut.measured_period, INPUT_PERIOD_SAMPLES);
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] measured period=%0d samples",
-                     dut.measured_period);
-        end
-
-        // Requirement 3: output must have two rising zero crossings per input
-        // cycle and retain the calibrated amplitude.
-        press_key2();
-        if (dut.mode_sel !== 2'd2) begin
-            $display("[CHECK FAIL] KEY2 did not cycle to double-frequency");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY2 cycles to double-frequency");
-        end
-        check_led_state(4'b1111, "wired double-frequency/8div");
-        wait_dac_samples(40);
-        check_pp(512, 12, "double-frequency 8div");
-        previous_y = $signed({1'b0, da_data}) - 512;
-        crossing_count = 0;
-        for (sample_index = 0;
-             sample_index < INPUT_PERIOD_SAMPLES * 5;
-             sample_index = sample_index + 1) begin
-            @(posedge da_clk);
-            #1;
-            current_y = $signed({1'b0, da_data}) - 512;
-            if ((previous_y < 0) && (current_y >= 0)) begin
-                crossing_count = crossing_count + 1;
-            end
-            previous_y = current_y;
-        end
-        if ((crossing_count < 9) || (crossing_count > 11)) begin
-            $display("[CHECK FAIL] double-frequency crossings=%0d expected=10",
-                     crossing_count);
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] double-frequency crossings=%0d",
-                     crossing_count);
-        end
-
-        // KEY4 is reserved and has no LED indication.
-        key4_n = 1'b0;
-        repeat (10) @(posedge pl_clk_50m);
-        check_led_state(4'b1111, "KEY4 held");
-        key4_n = 1'b1;
-        repeat (10) @(posedge pl_clk_50m);
-        if ((dut.mode_sel !== 2'd2) ||
-            (dut.amplitude_sel !== 2'd3) ||
-            (led_n !== 4'b1111)) begin
-            $display("[CHECK FAIL] reserved KEY4 changed state");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY4 is reserved");
-        end
-
-        // Frequency-range endpoint: return to quadrature mode and verify the
-        // largest supported delay at 1kHz.
-        press_key2();
-        press_key2();
-        press_key5();
-        fine_trim_before =
-            $signed(dut.u_lissajous_core.manual_phase_trim_word);
-        @(negedge ad_clk);
-        phase_rad = 0.0;
-        phase_step = 6.283185307179586 *
-                     LOW_FREQ_HZ / CONVERTER_CLK_HZ;
-        wait_dac_samples(LOW_FREQ_PERIOD_SAMPLES * 3);
-
-        if (dut.phase_cal_locked) begin
-            $display("[CHECK FAIL] frequency change did not invalidate phase lock");
-            error_count = error_count + 1;
-        end else if (($signed(
-                     dut.u_lissajous_core.manual_phase_trim_word) !==
-                     fine_trim_before) ||
-                     (dut.u_lissajous_core.manual_phase_adjust !== 32'd0)) begin
-            $display("[CHECK FAIL] fixed-angle trim was lost or active during relock");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] frequency change requests clean phase relock");
-        end
-
-        if ((dut.measured_period < LOW_FREQ_PERIOD_SAMPLES - 2) ||
-            (dut.measured_period > LOW_FREQ_PERIOD_SAMPLES + 2)) begin
-            $display("[CHECK FAIL] 1kHz measured period=%0d expected=%0d",
-                     dut.measured_period, LOW_FREQ_PERIOD_SAMPLES);
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] 1kHz measured period=%0d samples",
-                     dut.measured_period);
-        end
-
-        measure_peak_to_peak(LOW_FREQ_PERIOD_SAMPLES, pp_value);
-        if ((pp_value < 500) || (pp_value > 520)) begin
-            $display("[CHECK FAIL] 1kHz quadrature p-p=%0d", pp_value);
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] 1kHz quadrature p-p=%0d", pp_value);
-        end
-
-        correlation = 0;
-        x_energy = 0;
-        for (sample_index = 0;
-             sample_index < LOW_FREQ_PERIOD_SAMPLES;
-             sample_index = sample_index + 1) begin
-            @(posedge da_clk);
-            #1;
-            correlation = correlation +
-                (($signed({1'b0, ad_data}) - 512) *
-                 ($signed({1'b0, ad2_data}) - 512));
-            x_energy = x_energy +
-                (($signed({1'b0, ad_data}) - 512) *
-                 ($signed({1'b0, ad_data}) - 512));
-        end
-        correlation_ratio = (1.0 * correlation) / x_energy;
-        if ((correlation_ratio < -0.03) ||
-            (correlation_ratio > 0.03)) begin
-            $display("[CHECK FAIL] 1kHz quadrature correlation ratio=%0.4f",
-                     correlation_ratio);
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] 1kHz quadrature correlation ratio=%0.4f",
-                     correlation_ratio);
-        end
-
-        // Return to the default wired state before checking wireless mode.
-        press_key2();
-        press_key2();
-        if (dut.mode_sel !== 2'd0) begin
-            $display("[CHECK FAIL] KEY2 did not cycle back to direct mode");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY2 cycles back to direct mode");
-        end
-        check_led_state(4'b1111, "direct/8div restored");
-
-        phase_cal_wait_count = 0;
-        while (!dut.phase_cal_locked &&
-               (phase_cal_wait_count < LOW_FREQ_PERIOD_SAMPLES * 10)) begin
-            @(posedge da_clk);
-            phase_cal_wait_count = phase_cal_wait_count + 1;
-        end
-        if (!dut.phase_cal_locked ||
-            ($signed(dut.u_lissajous_core.manual_phase_trim_word) !==
-             fine_trim_before) ||
-            (dut.u_lissajous_core.manual_phase_adjust !==
-             fine_trim_before[31:0])) begin
-            $display("[CHECK FAIL] 1kHz relock: locked=%0b wait=%0d trim=%0d expected=%0d adjust=%h coarse=%0d error=%0d cal_period=%0d",
-                     dut.phase_cal_locked,
-                     phase_cal_wait_count,
-                     $signed(dut.u_lissajous_core.manual_phase_trim_word),
-                     fine_trim_before,
-                     dut.u_lissajous_core.manual_phase_adjust,
-                     dut.u_lissajous_core.phase_calibration_samples,
-                     dut.phase_error_samples,
-                     dut.u_lissajous_core.phase_calibration_period);
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] 1kHz relock restores the same phase angle");
-        end
-
-        // Holding a phase key must auto-repeat while preserving short-press
-        // resolution. Small parameter overrides keep this test short.
-        fine_trim_before =
-            $signed(dut.u_lissajous_core.manual_phase_trim_word);
-        key5_n = 1'b0;
-        repeat (260) @(posedge dut.sys_clk_100m);
-        key5_n = 1'b1;
-        repeat (10) @(posedge dut.sys_clk_100m);
-        if ($signed(dut.u_lissajous_core.manual_phase_trim_word) <=
-            fine_trim_before +
-            $signed({1'b0,
-                     dut.u_lissajous_core.MANUAL_PHASE_STEP_WORD})) begin
-            $display("[CHECK FAIL] held KEY5 did not auto-repeat");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] held KEY5 auto-repeats phase adjustment");
-        end
-
-        press_key1();
-        wait_dac_samples(2);
-        if (dut.wireless_mode !== 1'b1 ||
-            led_n[0] !== 1'b0 ||
-            da_data !== 10'd512 ||
-            da2_data !== 10'd512) begin
-            $display("[CHECK FAIL] KEY1 wireless state/safe output incorrect");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY1 selects wireless safe state");
-        end
-        check_led_state(4'b1110, "wireless direct/8div");
-
-        press_key2();
-        press_key3();
-        fine_trim_before =
-            $signed(dut.u_lissajous_core.manual_phase_trim_word);
-        press_key5();
-        press_key6();
-        wait_dac_samples(2);
-        if (dut.mode_sel !== 2'd0 ||
-            dut.amplitude_sel !== 2'd3 ||
-            $signed(dut.u_lissajous_core.manual_phase_trim_word) !==
-                fine_trim_before ||
-            da_data !== 10'd512) begin
-            $display("[CHECK FAIL] a wired-only key changed wireless state");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY2/KEY3/KEY5/KEY6 ignored in wireless mode");
-        end
-        check_led_state(4'b1110, "wireless reserved state");
-
-        press_key1();
-        if (dut.wireless_mode !== 1'b0 || led_n[0] !== 1'b1) begin
-            $display("[CHECK FAIL] KEY1 did not return to wired mode");
-            error_count = error_count + 1;
-        end else begin
-            $display("[CHECK PASS] KEY1 returns to wired mode");
-        end
-        check_led_state(4'b1111, "wired direct/8div");
-
-        if (error_count == 0) begin
-            $display("[SIM PASS] All requirement 1-4 RTL checks passed");
-        end else begin
-            $display("[SIM FAIL] %0d check(s) failed", error_count);
-        end
+        if (error_count == 0)
+            $display("[SIM PASS] Top-level continuous DPLL waveform controls passed");
+        else
+            $display("[SIM FAIL] %0d top-level check(s) failed",
+                     error_count);
 
         #100;
         $finish;
     end
-
 endmodule

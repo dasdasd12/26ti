@@ -1,5 +1,6 @@
 param(
     [string]$Testbench = "sim/tb_lissajous_top.sv",
+    [string]$Top = "tb_lissajous_top",
     [string]$Output = "icarus/tb_lissajous_top.vvp",
     [string]$Waveform = "sim/tb_lissajous_top.vcd",
     [switch]$OpenWave
@@ -20,7 +21,7 @@ $simulationSupportFiles =
     Select-Object -ExpandProperty FullName
 
 Write-Host "Compiling SystemVerilog..."
-& iverilog -g2012 -Wall -s tb_lissajous_top -o $Output `
+& iverilog -g2012 -Wall -s $Top -o $Output `
     $Testbench $sourceFiles $simulationSupportFiles
 if ($LASTEXITCODE -ne 0) {
     throw "iverilog failed with exit code $LASTEXITCODE"
