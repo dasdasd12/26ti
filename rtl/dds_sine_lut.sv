@@ -5,11 +5,13 @@ module dds_sine_lut (
     output logic signed [10:0] sine_sample
 );
 
-    logic [1:0] quadrant;
-    logic [5:0] quarter_phase;
-    logic [6:0] lut_index;
-    logic [8:0] magnitude;
-    logic signed [10:0] magnitude_signed;
+    logic signed [10:0] sample_base;
+    logic signed [10:0] sample_next;
+    logic [7:0] interpolation_fraction;
+    logic signed [11:0] sample_delta;
+    logic signed [20:0] interpolation_product;
+    logic signed [20:0] rounded_product;
+    logic signed [12:0] interpolated_sample;
 
     function automatic logic [8:0] quarter_sine(
         input logic [6:0] index
@@ -85,23 +87,50 @@ module dds_sine_lut (
         end
     endfunction
 
+    function automatic logic signed [10:0] sine_at_index(
+        input logic [7:0] index
+    );
+        logic [1:0] index_quadrant;
+        logic [5:0] index_phase;
+        logic [6:0] index_mirrored;
+        logic [8:0] index_magnitude;
+        logic signed [10:0] index_magnitude_signed;
+        begin
+            index_quadrant = index[7:6];
+            index_phase = index[5:0];
+            if ((index_quadrant == 2'd0) ||
+                (index_quadrant == 2'd2)) begin
+                index_mirrored = {1'b0, index_phase};
+            end else begin
+                index_mirrored = 7'd64 - {1'b0, index_phase};
+            end
+
+            index_magnitude = quarter_sine(index_mirrored);
+            index_magnitude_signed =
+                $signed({2'b00, index_magnitude});
+            if (index_quadrant[1]) begin
+                sine_at_index = -index_magnitude_signed;
+            end else begin
+                sine_at_index = index_magnitude_signed;
+            end
+        end
+    endfunction
+
     always @* begin
-        quadrant = phase[31:30];
-        quarter_phase = phase[29:24];
-
-        if ((quadrant == 2'd0) || (quadrant == 2'd2)) begin
-            lut_index = {1'b0, quarter_phase};
+        sample_base = sine_at_index(phase[31:24]);
+        sample_next = sine_at_index(phase[31:24] + 1'b1);
+        interpolation_fraction = phase[23:16];
+        sample_delta = $signed(sample_next) - $signed(sample_base);
+        interpolation_product =
+            sample_delta * $signed({1'b0, interpolation_fraction});
+        if (interpolation_product[20]) begin
+            rounded_product = interpolation_product + 21'sd127;
         end else begin
-            lut_index = 7'd64 - {1'b0, quarter_phase};
+            rounded_product = interpolation_product + 21'sd128;
         end
-
-        magnitude = quarter_sine(lut_index);
-        magnitude_signed = $signed({2'b00, magnitude});
-        if (quadrant[1]) begin
-            sine_sample = -magnitude_signed;
-        end else begin
-            sine_sample = magnitude_signed;
-        end
+        interpolated_sample =
+            $signed(sample_base) + ($signed(rounded_product) >>> 8);
+        sine_sample = interpolated_sample[10:0];
     end
 
 endmodule

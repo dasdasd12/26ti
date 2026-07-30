@@ -2,12 +2,15 @@
 /icarus/
 /sim/*.vcd
 /sim/*.fst
+/sim/*.out
 /build/
 /.Xil/
 /hs_err_pid*.dmp
 /hs_err_pid*.log
 /phase sim/output/
 /phase sim/direct_output/
+/.pytest_cache/
+**/__pycache__/
 
 # PDF inspection intermediates
 /tmp/

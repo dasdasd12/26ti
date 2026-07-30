@@ -1,20 +1,28 @@
 `timescale 1ns/1ps
 
 module manual_control #(
-    parameter integer DEBOUNCE_CYCLES = 1_000_000
+    parameter integer DEBOUNCE_CYCLES = 1_000_000,
+    // Retained in the interface for project compatibility. Continuous DPLL
+    // operation no longer uses manual phase-key auto-repeat.
+    parameter integer PHASE_HOLD_DELAY_CYCLES = 50_000_000,
+    parameter integer PHASE_REPEAT_CYCLES = 500_000
 ) (
     input  logic clk,
     input  logic rst_n,
     input  logic key1_n,
     input  logic key2_n,
     input  logic key3_n,
+    input  logic key4_n,
     input  logic key5_n,
     input  logic key6_n,
     output logic wireless_mode,
     output logic [1:0] mode_sel,
     output logic [1:0] amplitude_sel,
-    output logic fine_phase_inc_pulse,
-    output logic fine_phase_dec_pulse
+    output logic dac2_frequency_advance_pulse,
+    output logic frequency_cal_start_pulse,
+    output logic wireless_start_pulse,
+    output logic [1:0] wireless_start_pattern,
+    output logic wireless_abort_pulse
 );
 
     localparam logic [1:0] MODE_DIRECT = 2'd0;
@@ -25,6 +33,7 @@ module manual_control #(
     logic key1_press;
     logic key2_press;
     logic key3_press;
+    logic key4_press;
     logic key5_press;
     logic key6_press;
 
@@ -34,7 +43,8 @@ module manual_control #(
         .clk(clk),
         .rst_n(rst_n),
         .button_n(key1_n),
-        .press_pulse(key1_press)
+        .press_pulse(key1_press),
+        .pressed()
     );
 
     button_debounce #(
@@ -43,7 +53,8 @@ module manual_control #(
         .clk(clk),
         .rst_n(rst_n),
         .button_n(key2_n),
-        .press_pulse(key2_press)
+        .press_pulse(key2_press),
+        .pressed()
     );
 
     button_debounce #(
@@ -52,7 +63,18 @@ module manual_control #(
         .clk(clk),
         .rst_n(rst_n),
         .button_n(key3_n),
-        .press_pulse(key3_press)
+        .press_pulse(key3_press),
+        .pressed()
+    );
+
+    button_debounce #(
+        .DEBOUNCE_CYCLES(DEBOUNCE_CYCLES)
+    ) u_key4 (
+        .clk(clk),
+        .rst_n(rst_n),
+        .button_n(key4_n),
+        .press_pulse(key4_press),
+        .pressed()
     );
 
     button_debounce #(
@@ -61,7 +83,8 @@ module manual_control #(
         .clk(clk),
         .rst_n(rst_n),
         .button_n(key5_n),
-        .press_pulse(key5_press)
+        .press_pulse(key5_press),
+        .pressed()
     );
 
     button_debounce #(
@@ -70,12 +93,29 @@ module manual_control #(
         .clk(clk),
         .rst_n(rst_n),
         .button_n(key6_n),
-        .press_pulse(key6_press)
+        .press_pulse(key6_press),
+        .pressed()
     );
 
     always @* begin
-        fine_phase_inc_pulse = !wireless_mode && key5_press;
-        fine_phase_dec_pulse = !wireless_mode && key6_press;
+        frequency_cal_start_pulse =
+            !wireless_mode && key4_press;
+        dac2_frequency_advance_pulse =
+            key5_press;
+        wireless_start_pulse =
+            wireless_mode &&
+            (key2_press || key3_press || key4_press);
+        wireless_abort_pulse =
+            wireless_mode && key6_press;
+        if (key2_press) begin
+            wireless_start_pattern = 2'd1;
+        end else if (key3_press) begin
+            wireless_start_pattern = 2'd2;
+        end else if (key4_press) begin
+            wireless_start_pattern = 2'd3;
+        end else begin
+            wireless_start_pattern = 2'd0;
+        end
     end
 
     always_ff @(posedge clk or negedge rst_n) begin
@@ -88,14 +128,15 @@ module manual_control #(
                 wireless_mode <= ~wireless_mode;
             end
 
-            // Shape and amplitude controls are active only in wired mode.
-            // Wireless-mode behavior is reserved for a later implementation.
             if (!wireless_mode) begin
                 if (key2_press) begin
                     case (mode_sel)
-                        MODE_DIRECT:     mode_sel <= MODE_QUADRATURE;
-                        MODE_QUADRATURE: mode_sel <= MODE_DOUBLE;
-                        default:         mode_sel <= MODE_DIRECT;
+                        MODE_DIRECT:
+                            mode_sel <= MODE_QUADRATURE;
+                        MODE_QUADRATURE:
+                            mode_sel <= MODE_DOUBLE;
+                        default:
+                            mode_sel <= MODE_DIRECT;
                     endcase
                 end
 

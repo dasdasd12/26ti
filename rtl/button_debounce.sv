@@ -6,7 +6,8 @@ module button_debounce #(
     input  logic clk,
     input  logic rst_n,
     input  logic button_n,
-    output logic press_pulse
+    output logic press_pulse,
+    output logic pressed
 );
 
     localparam integer COUNTER_WIDTH =
@@ -15,6 +16,10 @@ module button_debounce #(
     logic [1:0] button_sync;
     logic stable_n;
     logic [COUNTER_WIDTH-1:0] debounce_count;
+
+    always @* begin
+        pressed = !stable_n;
+    end
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
